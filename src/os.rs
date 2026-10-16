@@ -2,40 +2,12 @@
 //!
 //! Windows calls are declared here against kernel32, which every Windows has; no crate, no prebuilt import library.
 
-use std::fs::{FileType, Metadata};
+use std::fs::Metadata;
 use std::path::Path;
 
-/// What a link found during the walk is. It is listed, never followed: following a junction counts a tree twice
-/// (2026-10-16: `Gorilla.firefox\src` is a junction to `Build.Work\firefox\157.0-truth`; a walk that followed it
-/// would have reported 4.5 GiB that exist only once).
-pub fn link_kind(ft: &FileType, md: &Metadata) -> Option<&'static str> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const REPARSE: u32 = 0x400;
-        if md.file_attributes() & REPARSE != 0 {
-            // a reparse point that is a plain file (dedup, cloud placeholder, WIM) is still a file with a size;
-            // a reparse DIRECTORY (junction, mount point, directory symlink) is never entered
-            if ft.is_symlink() {
-                return Some(if ft.is_dir() || md.is_dir() { "directory link" } else { "file symlink" });
-            }
-            if md.is_dir() {
-                return Some("junction or mount point");
-            }
-            return None;
-        }
-        None
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = md;
-        if ft.is_symlink() {
-            Some("symlink")
-        } else {
-            None
-        }
-    }
-}
+// Links are classified in fastdir (from the listing itself: the reparse tag comes with it on Windows). They are
+// listed, never followed: following a junction counts a tree twice (2026-10-16: `Gorilla.firefox\src` is a
+// junction to `Build.Work\firefox\157.0-truth`; a walk that followed it would report 4.5 GiB that exist once).
 
 /// The file system (device) a directory lives on, to stay on one (Unix). Windows: mounted volumes inside a folder
 /// are reparse points, so they are never entered anyway.
@@ -99,6 +71,19 @@ pub fn disk_size(path: &Path, md: &Metadata, cluster: u64, windows_check: bool) 
     {
         let _ = (path, cluster, windows_check);
         md.len()
+    }
+}
+
+/// A directory that is a reparse point (junction, mount point, directory symlink): never entered.
+pub fn is_reparse_dir(md: &Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        md.is_dir() && md.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        md.file_type().is_symlink()
     }
 }
 

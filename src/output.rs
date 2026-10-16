@@ -11,6 +11,12 @@ pub struct Style {
     pub depth: usize,
     pub disk: bool,
     pub width: usize,
+    /// smallest first (dust -r)
+    pub reverse: bool,
+    /// attributes/permissions and date on every line
+    pub long: bool,
+    /// one flat list of paths at --depth, biggest first, instead of a tree
+    pub flat: bool,
 }
 
 fn bar(frac: f64, width: usize, ascii: bool) -> String {
@@ -27,18 +33,53 @@ fn kind_mark(n: &Node) -> &'static str {
     }
 }
 
+fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{} {}", count(n), if n == 1 { one } else { many })
+}
+
+fn long_cols(n: &Node, st: &Style) -> String {
+    if st.long {
+        format!("{} {}  ", crate::fastdir::attr_letters(n.attrs), date(n.mtime))
+    } else {
+        String::new()
+    }
+}
+
 pub fn text(rep: &Report, st: &Style, out: &mut String) {
     let root = &rep.root;
-    let total = root.bytes.max(1) as f64;
     let size = |n: &Node| if st.disk { n.disk } else { n.bytes };
+    let total = size(root).max(1) as f64;
     out.push_str(&format!("{:>10} {:>6}  {}  {}{}   {}, {}\n", human(size(root)), "100%",
                           bar(1.0, st.width, st.ascii), root.name, kind_mark(root),
                           plural(root.files, "file", "files"), plural(root.dirs, "folder", "folders")));
+    if st.flat {
+        let mut rows = Vec::new();
+        flat(root, "", 1, st, &mut rows);
+        rows.sort_by(|a, b| if st.reverse { a.0.cmp(&b.0) } else { b.0.cmp(&a.0) }.then_with(|| a.1.cmp(&b.1)));
+        let shown = rows.len().min(st.per_level);
+        for (b, p, n) in &rows[..shown] {
+            out.push_str(&format!("{:>10} {:>5.1}%  {}  {}{p}\n", human(*b), *b as f64 / total * 100.0,
+                                  bar(*b as f64 / total, st.width, st.ascii), long_cols(n, st)));
+        }
+        if rows.len() > shown {
+            let b: u64 = rows[shown..].iter().map(|r| r.0).sum();
+            out.push_str(&format!("{:>10} {:>5.1}%  {}  ... {} more\n", human(b), b as f64 / total * 100.0,
+                                  bar(b as f64 / total, st.width, st.ascii), count((rows.len() - shown) as u64)));
+        }
+        return;
+    }
     tree(root, "", 1, st, total, out);
 }
 
-fn plural(n: u64, one: &str, many: &str) -> String {
-    format!("{} {}", count(n), if n == 1 { one } else { many })
+fn flat<'a>(n: &'a Node, prefix: &str, level: usize, st: &Style, rows: &mut Vec<(u64, String, &'a Node)>) {
+    for c in &n.children {
+        let p = if prefix.is_empty() { c.name.clone() } else { format!("{prefix}/{}", c.name) };
+        if level == st.depth || c.children.is_empty() {
+            rows.push((if st.disk { c.disk } else { c.bytes }, format!("{p}{}", kind_mark(c)), c));
+        } else {
+            flat(c, &p, level + 1, st, rows);
+        }
+    }
 }
 
 fn tree(n: &Node, prefix: &str, level: usize, st: &Style, total: f64, out: &mut String) {
@@ -46,25 +87,42 @@ fn tree(n: &Node, prefix: &str, level: usize, st: &Style, total: f64, out: &mut 
         return;
     }
     let size = |n: &Node| if st.disk { n.disk } else { n.bytes };
-    let shown = n.children.len().min(st.per_level);
-    let rest = &n.children[shown..];
+    let mut kids: Vec<&Node> = n.children.iter().collect();
+    if st.reverse {
+        kids.reverse();
+    }
+    let shown = kids.len().min(st.per_level);
+    let rest = &kids[shown..];
     let (tee, ell, pipe, gap) = if st.ascii { ("|-- ", "`-- ", "|   ", "    ") } else { ("├─ ", "└─ ", "│  ", "   ") };
-    for (i, c) in n.children[..shown].iter().enumerate() {
+    for (i, c) in kids[..shown].iter().enumerate() {
         let last = i + 1 == shown && rest.is_empty();
         let frac = size(c) as f64 / total;
         let extra = if c.kind == Kind::Dir { format!("   {}", plural(c.files, "file", "files")) } else { String::new() };
-        out.push_str(&format!("{:>10} {:>5.1}%  {}  {}{}{}{}{}\n", human(size(c)), frac * 100.0,
-                              bar(frac, st.width, st.ascii), prefix, if last { ell } else { tee }, c.name,
-                              kind_mark(c), extra));
+        out.push_str(&format!("{:>10} {:>5.1}%  {}  {}{}{}{}{}{}\n", human(size(c)), frac * 100.0,
+                              bar(frac, st.width, st.ascii), long_cols(c, st), prefix, if last { ell } else { tee },
+                              c.name, kind_mark(c), extra));
         if c.kind == Kind::Dir {
             let p = format!("{prefix}{}", if last { gap } else { pipe });
             tree(c, &p, level + 1, st, total, out);
         }
     }
     if !rest.is_empty() {
-        let b: u64 = rest.iter().map(size).sum();
+        let b: u64 = rest.iter().map(|c| size(c)).sum();
         out.push_str(&format!("{:>10} {:>5.1}%  {}  {}{}... {} more\n", human(b), b as f64 / total * 100.0,
                               bar(b as f64 / total, st.width, st.ascii), prefix, ell, count(rest.len() as u64)));
+    }
+}
+
+pub fn types_text(rep: &Report, n: usize, out: &mut String) {
+    let total: u64 = rep.types.iter().map(|t| t.1).sum::<u64>().max(1);
+    out.push_str("\nBy type:\n");
+    for (ext, b, files) in rep.types.iter().take(n) {
+        let e = if ext.is_empty() { "(no extension)".to_string() } else { format!(".{ext}") };
+        out.push_str(&format!("{:>10} {:>5.1}%  {:>9}  {e}\n", human(*b), *b as f64 / total as f64 * 100.0,
+                              plural(*files, "file", "files")));
+    }
+    if rep.types.len() > n {
+        out.push_str(&format!("   ... {} more types\n", rep.types.len() - n));
     }
 }
 
@@ -81,6 +139,13 @@ pub fn notes(rep: &Report, disk_measured: bool, hardlinks_checked: bool, out: &m
     if !rep.other_fs.is_empty() {
         out.push_str(&format!("other file systems not entered: {} (--cross-filesystems to enter them)\n",
                               count(rep.other_fs.len() as u64)));
+    }
+    if rep.excluded > 0 {
+        out.push_str(&format!("excluded by .gitignore/--exclude: {} entries (not counted)\n", count(rep.excluded)));
+    }
+    if rep.hidden_skipped > 0 {
+        out.push_str(&format!("hidden entries skipped: {} (not counted; drop --no-hidden to count them)\n",
+                              count(rep.hidden_skipped)));
     }
     out.push_str(&format!("unreadable: {}{}\n", count(rep.errors.len() as u64),
                           if rep.errors.is_empty() { "" } else { "  (--list-errors to see them)" }));
@@ -102,15 +167,27 @@ pub fn skipped_list(title: &str, v: &[Skipped], out: &mut String) {
     }
 }
 
+fn kind_short(k: Kind) -> &'static str {
+    match k {
+        Kind::Dir => "dir ",
+        Kind::File => "file",
+        Kind::Link => "link",
+    }
+}
+
 pub fn found_text(v: &[Found], out: &mut String) {
     for f in v {
-        let k = match f.kind {
-            Kind::Dir => "dir ",
-            Kind::File => "file",
-            Kind::Link => "link",
-        };
-        out.push_str(&format!("{:>10}  {k}  {}  {}\n", human(f.bytes), date(f.mtime), f.path));
+        out.push_str(&format!("{:>10}  {}  {}  {}\n", human(f.bytes), kind_short(f.kind), date(f.mtime), f.path));
     }
+}
+
+/// `--format`: {path} {name} {bytes} {size} {kind} {mtime} {date}, \t and \n escapes.
+pub fn format_found(fmt: &str, f: &Found) -> String {
+    let name = std::path::Path::new(&f.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    fmt.replace("\\t", "\t").replace("\\n", "\n")
+        .replace("{path}", &f.path).replace("{name}", &name).replace("{bytes}", &f.bytes.to_string())
+        .replace("{size}", &human(f.bytes)).replace("{kind}", kind_name(f.kind))
+        .replace("{mtime}", &f.mtime.map(|t| t.to_string()).unwrap_or_default()).replace("{date}", &date(f.mtime))
 }
 
 /// seconds since 1970 -> "2026-10-16" (UTC); "-" when unknown
@@ -130,7 +207,7 @@ pub fn date(t: Option<u64>) -> String {
     format!("{:04}-{:02}-{:02}", if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-fn kind_name(k: Kind) -> &'static str {
+pub fn kind_name(k: Kind) -> &'static str {
     match k {
         Kind::Dir => "dir",
         Kind::File => "file",
@@ -141,6 +218,9 @@ fn kind_name(k: Kind) -> &'static str {
 pub fn node_json(n: &Node) -> Value {
     let mut v = json!({"name": n.name, "kind": kind_name(n.kind), "bytes": n.bytes, "disk_bytes": n.disk,
                        "files": n.files, "dirs": n.dirs, "mtime": n.mtime});
+    if n.attrs != 0 {
+        v["attrs"] = json!(crate::fastdir::attr_letters(n.attrs));
+    }
     if !n.children.is_empty() {
         v["children"] = Value::Array(n.children.iter().map(node_json).collect());
     }
@@ -151,9 +231,16 @@ pub fn skipped_json(v: &[Skipped]) -> Value {
     Value::Array(v.iter().map(|s| json!({"path": s.path, "why": s.why})).collect())
 }
 
+pub fn found_one(f: &Found) -> Value {
+    json!({"path": f.path, "kind": kind_name(f.kind), "bytes": f.bytes, "mtime": f.mtime})
+}
+
 pub fn found_json(v: &[Found]) -> Value {
-    Value::Array(v.iter().map(|f| json!({"path": f.path, "kind": kind_name(f.kind), "bytes": f.bytes,
-                                         "mtime": f.mtime})).collect())
+    Value::Array(v.iter().map(found_one).collect())
+}
+
+pub fn types_json(rep: &Report) -> Value {
+    Value::Array(rep.types.iter().map(|(e, b, n)| json!({"ext": e, "bytes": b, "files": n})).collect())
 }
 
 #[cfg(test)]
@@ -179,5 +266,11 @@ mod tests {
         assert_eq!(bar(0.5, 4, true), "##..");
         assert_eq!(bar(2.0, 3, true), "###");
         assert_eq!(bar(0.0, 2, false), "░░");
+    }
+
+    #[test]
+    fn format_fields() {
+        let f = Found { path: "C:/x/a.log".into(), kind: Kind::File, bytes: 2048, mtime: Some(0) };
+        assert_eq!(format_found("{name}\\t{bytes}\\t{size}\\t{date}", &f), "a.log\t2048\t2.00 KiB\t1970-01-01");
     }
 }

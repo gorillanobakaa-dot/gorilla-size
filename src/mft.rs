@@ -393,11 +393,11 @@ mod imp {
                                                         recs[k as usize].name.clone())).collect();
                 children.sort_by(|a: &Node, b: &Node| b.bytes.cmp(&a.bytes).then_with(|| a.name.cmp(&b.name)));
             }
-            Node { name, kind, bytes: b, disk: d, files: f, dirs: s, mtime: r.mtime, children }
+            Node { name, kind, bytes: b, disk: d, files: f, dirs: s, mtime: r.mtime, attrs: 0, children }
         }
         let root = node(cur, 0, depth, recs, &kids, &tot, path.display().to_string());
         Ok(Report { root, top_files: topv, links, errors: vec![], other_fs: vec![], found: vec![],
-                    hardlink_repeats: 0, hardlink_bytes: 0 })
+                    hardlink_repeats: 0, hardlink_bytes: 0, types: vec![], excluded: 0, hidden_skipped: 0 })
     }
 
     #[cfg(test)]
