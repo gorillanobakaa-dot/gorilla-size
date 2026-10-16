@@ -53,6 +53,8 @@ ACT (verified, journalled, undoable; never a permanent delete)
   gorilla-size recycle PATH ...            to the Recycle Bin / trash; refused when Windows would destroy instead;
                                            verified in the bin's own records
   gorilla-size undo JOURNAL                reverse what a journal records
+  gorilla-size trash [list]                what is in the Recycle Bin / trash: original place, size, date
+  gorilla-size trash restore NAME|PATH ... put items back (by original path, or by name when it is unique)
   gorilla-size apply PLAN                  carry out a plan written for a large operation
   find ... --copy-to DIR | --move-to DIR | --recycle    the same, on what find matched
 
@@ -151,8 +153,9 @@ struct Args {
     rounds: usize,
 }
 
-const MODES: [&str; 19] = ["find", "compare", "types", "newest", "oldest", "watch", "free", "hash", "dupes", "empty",
-                           "reparse", "copy", "move", "recycle", "undo", "apply", "profile", "report", "bench"];
+const MODES: [&str; 20] = ["find", "compare", "types", "newest", "oldest", "watch", "free", "hash", "dupes", "empty",
+                           "reparse", "copy", "move", "recycle", "undo", "apply", "profile", "report", "bench",
+                           "trash"];
 
 fn parse(argv: Vec<String>) -> Result<Args, String> {
     let mut a = Args { mode: "report".into(), depth: 1, sort: "size".into(), max_bytes: 16384, max_hits: 20,
@@ -321,6 +324,7 @@ fn main() -> ExitCode {
         "profile" => run_profile(&a),
         "watch" => run_watch(&a),
         "bench" => run_bench(&a, &bench_args),
+        "trash" => run_trash(&a),
         _ => run_measure(&a, threads_from),
     };
     ExitCode::from(code)
@@ -949,6 +953,59 @@ fn run_watch(a: &Args) -> u8 {
             return 0;
         }
         std::thread::sleep(std::time::Duration::from_secs(every));
+    }
+}
+
+/// trash [list] | trash restore NAME-OR-ORIGINAL-PATH ...: what is in the Recycle Bin / trash, read from its own
+/// records, and putting items back. Emptying it is not here: gorilla-size never deletes for good.
+fn run_trash(a: &Args) -> u8 {
+    let sub = a.paths.first().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "list".into());
+    match sub.as_str() {
+        "list" => {
+            let all = actions::bin_list();
+            let (orphans, v): (Vec<_>, Vec<_>) = all.into_iter().partition(|i| i.orphan());
+            let total: u64 = v.iter().map(|i| i.bytes).sum();
+            if a.json {
+                let one = |i: &actions::BinItem| json!({"original": i.original, "bytes": i.bytes, "deleted": i.deleted,
+                                                         "item": i.item.display().to_string()});
+                print_json(&json!({"items": v.iter().map(one).collect::<Vec<_>>(), "count": v.len(), "bytes": total,
+                                   "orphan_records": orphans.iter().map(one).collect::<Vec<_>>()}));
+            } else {
+                for i in v.iter().take(a.number.unwrap_or(usize::MAX)) {
+                    println!("{:>10}  {}  {}", units::human(i.bytes), output::date(i.deleted), i.original);
+                }
+                println!("{} item(s), {} in the Recycle Bin", v.len(), units::human(total));
+                if !orphans.is_empty() {
+                    println!("{} record(s) whose item is gone (Explorer hides them; not counted):", orphans.len());
+                    for i in &orphans {
+                        println!("            {}  {}", output::date(i.deleted), i.original);
+                    }
+                }
+            }
+            0
+        }
+        "restore" => {
+            let wanted: Vec<String> = a.paths[1..].iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            if wanted.is_empty() {
+                eprintln!("gorilla-size trash restore: give the original path (or the name) of what to put back");
+                return 2;
+            }
+            let done = actions::bin_restore(&wanted);
+            let failed = done.iter().filter(|d| !d.ok).count();
+            if a.json {
+                print_json(&json!({"ok": done.len() - failed, "failed": failed, "actions": done.iter().map(|d|
+                    json!({"op": d.op, "from": d.from, "to": d.to, "ok": d.ok, "why": d.why})).collect::<Vec<_>>()}));
+            } else {
+                for d in &done {
+                    println!("{} {} -> {}  ({})", if d.ok { "OK  " } else { "FAIL" }, d.from, d.to, d.why);
+                }
+            }
+            if failed > 0 { 3 } else { 0 }
+        }
+        x => {
+            eprintln!("gorilla-size trash: {x}? use list or restore");
+            2
+        }
     }
 }
 

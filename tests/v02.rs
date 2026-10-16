@@ -378,6 +378,30 @@ fn bench_gives_a_verdict_only_when_the_runs_do_not_overlap() {
 }
 
 #[test]
+fn trash_lists_what_was_recycled_and_restores_it_by_name() {
+    if !bin_available() {
+        return;
+    }
+    let t = tmp("trashlist");
+    let name = format!("gorilla-size-trash-{}.txt", std::process::id());
+    let victim = t.0.join(&name);
+    file(&victim, b"twelve bytes");
+    let v = json(&["recycle", s(&victim)]);
+    assert_eq!(v["failed"], 0, "{v}");
+    let l = json(&["trash", "list"]);
+    let mine: Vec<&Value> = l["items"].as_array().unwrap().iter()
+        .filter(|i| i["original"].as_str().unwrap().ends_with(&name)).collect();
+    assert_eq!(mine.len(), 1, "{l}");
+    assert_eq!(mine[0]["bytes"], 12);
+    let r = json(&["trash", "restore", &name]);
+    assert_eq!(r["failed"], 0, "{r}");
+    assert_eq!(fs::read(&victim).unwrap(), b"twelve bytes");
+    let (rc, out, _) = run(&["trash", "restore", "no-such-thing-in-any-bin.xyz"]);
+    assert_eq!(rc, 3);
+    assert!(out.contains("nothing in the bin by that name"), "{out}");
+}
+
+#[test]
 fn newest_and_oldest() {
     let t = tmp("age");
     file(&t.0.join("old"), b"1");

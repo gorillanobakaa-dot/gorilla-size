@@ -520,6 +520,33 @@ mod bin {
         Err("no free name in the Recycle Bin; nothing touched".into())
     }
 
+    /// Everything in this account's Recycle Bin on every drive, from the bin's own $I records.
+    pub fn list() -> Vec<super::BinItem> {
+        let Ok(sid) = sid() else { return vec![] };
+        let mut out = Vec::new();
+        for l in b'A'..=b'Z' {
+            let dir = PathBuf::from(format!("{}:\\$Recycle.Bin\\{sid}", l as char));
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let Some(rest) = name.strip_prefix("$I") else { continue };
+                let Ok(b) = fs::read(e.path()) else { continue };
+                if b.len() < 24 {
+                    continue;
+                }
+                let bytes = u64::from_le_bytes(b[8..16].try_into().unwrap());
+                let ft = u64::from_le_bytes(b[16..24].try_into().unwrap());
+                out.push(super::BinItem {
+                    item: dir.join(format!("$R{rest}")),
+                    original: original_of(&e.path()).unwrap_or_default(),
+                    bytes,
+                    deleted: (ft / 10_000_000).checked_sub(11_644_473_600),
+                });
+            }
+        }
+        out
+    }
+
     pub fn restore(item: &Path, original: &Path) -> Result<(), String> {
         if original.exists() {
             return Err(format!("{} exists again; restore by hand from the Recycle Bin", original.display()));
@@ -651,4 +678,94 @@ mod bin {
         }
         Ok(())
     }
+
+    fn unescape(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Everything in the freedesktop trash, from its .trashinfo records.
+    pub fn list() -> Vec<super::BinItem> {
+        let Some(t) = trash() else { return vec![] };
+        let Ok(rd) = fs::read_dir(t.join("info")) else { return vec![] };
+        let mut out = Vec::new();
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(base) = name.strip_suffix(".trashinfo") else { continue };
+            let text = fs::read_to_string(e.path()).unwrap_or_default();
+            let original = text.lines().find_map(|l| l.strip_prefix("Path=")).map(unescape).unwrap_or_default();
+            let item = t.join("files").join(base);
+            let deleted = fs::metadata(e.path()).and_then(|m| m.modified()).ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+            out.push(super::BinItem { bytes: super::tally(&item).1, item, original, deleted });
+        }
+        out
+    }
+}
+
+/// One item in the Recycle Bin / trash.
+#[derive(Debug, Clone)]
+pub struct BinItem {
+    /// where it is now (the $R... file or folder, or Trash/files/NAME)
+    pub item: PathBuf,
+    pub original: String,
+    pub bytes: u64,
+    pub deleted: Option<u64>,
+}
+
+impl BinItem {
+    /// a record whose item is gone (2026-10-16: a $I file from September outlived an emptied bin; Explorer hides
+    /// such records, so they are listed apart and never counted)
+    pub fn orphan(&self) -> bool {
+        std::fs::symlink_metadata(&self.item).is_err()
+    }
+}
+
+pub fn bin_list() -> Vec<BinItem> {
+    let mut v = bin::list();
+    v.sort_by(|a, b| b.deleted.cmp(&a.deleted).then_with(|| a.original.cmp(&b.original)));
+    v
+}
+
+/// Put items back by original path, or by name when only one item has that name. Journalled, like every action.
+pub fn bin_restore(wanted: &[String]) -> Vec<Done> {
+    let items = bin_list();
+    let mut j = match Journal::open("restore") {
+        Ok(j) => j,
+        Err(e) => return vec![done("restore", Path::new(""), Path::new(""), false, e.to_string())],
+    };
+    let mut out = Vec::new();
+    for w in wanted {
+        let wl = w.to_lowercase();
+        let hits: Vec<&BinItem> = items.iter().filter(|i| {
+            let o = i.original.to_lowercase();
+            o == wl || Path::new(&o).file_name().map(|n| n.to_string_lossy() == wl).unwrap_or(false)
+        }).collect();
+        let d = match hits.as_slice() {
+            [one] => match bin::restore(&one.item, Path::new(&one.original)) {
+                Ok(()) => done("restore", &one.item, Path::new(&one.original), Path::new(&one.original).exists(),
+                               "put back from the bin"),
+                Err(e) => done("restore", &one.item, Path::new(&one.original), false, e),
+            },
+            [] => done("restore", Path::new(w), Path::new(""), false, "nothing in the bin by that name"),
+            many => done("restore", Path::new(w), Path::new(""), false,
+                         format!("{} items in the bin have that name; give the full original path", many.len())),
+        };
+        let _ = j.write(&json!({"op": "restore", "from": d.from, "to": d.to, "ok": d.ok, "why": d.why}));
+        out.push(d);
+    }
+    out
 }
