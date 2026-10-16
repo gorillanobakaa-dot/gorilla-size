@@ -45,6 +45,8 @@ pub struct Node {
 #[derive(Default)]
 pub struct Filter {
     pub names: Vec<Glob>,
+    /// --regex: name matches any of these regular expressions
+    pub regexes: Vec<regex::Regex>,
     pub exts: Vec<String>,
     pub min: Option<u64>,
     pub max: Option<u64>,
@@ -59,6 +61,9 @@ impl Filter {
             return false;
         }
         if !self.names.is_empty() && !self.names.iter().any(|g| g.matches(name)) {
+            return false;
+        }
+        if !self.regexes.is_empty() && !self.regexes.iter().any(|r| r.is_match(name)) {
             return false;
         }
         if !self.exts.is_empty() {

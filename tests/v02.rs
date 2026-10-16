@@ -248,6 +248,22 @@ fn dupes_empty_reparse_free_hash_from_the_command_line() {
 }
 
 #[test]
+fn regular_expressions_for_names_and_inside_files() {
+    let t = tmp("re");
+    file(&t.0.join("001-fix.patch"), b"+ pref(\"a\", 1);\n- old\n");
+    file(&t.0.join("readme.patch.orig"), b"x\n");
+    file(&t.0.join("v2-thing.patch"), b"nothing\n");
+    let (_, out, _) = run(&["find", s(&t.0), "--regex", r"^\d{3}-.*\.patch$", "--paths"]);
+    assert_eq!(out.lines().count(), 1, "{out}");
+    assert!(out.contains("001-fix.patch"));
+    let (_, out, _) = run(&["find", s(&t.0), "--ext", "patch", "--grep-re", r#"^\+ pref\("\w+""#]);
+    assert!(out.contains("1: + pref(\"a\", 1);"), "{out}");
+    let (rc, _, err) = run(&["find", s(&t.0), "--regex", "(unclosed"]);
+    assert_eq!(rc, 2);
+    assert!(err.contains("not a regular expression"), "{err}");
+}
+
+#[test]
 fn newest_and_oldest() {
     let t = tmp("age");
     file(&t.0.join("old"), b"1");

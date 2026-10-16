@@ -74,11 +74,12 @@ REPORT OPTIONS
   --json               machine-readable                    --ascii          plain characters
 
 FIND FILTERS AND OUTPUT
-  --name GLOB  --ext a,b  --min-size S  --max-size S  --newer AGE  --older AGE  --type f|d|l
+  --name GLOB  --regex RE  --ext a,b  --min-size S  --max-size S  --newer AGE  --older AGE  --type f|d|l
   --sort size|name|age   -n N   -i/--ignore-case  -s/--case-sensitive
   --paths  -0/--print0  --jsonl  --format '{path}\\t{bytes}\\t{size}\\t{kind}\\t{date}\\t{name}'
   --head N  --tail N  --lines A:B   (show those lines of each matched text file)   --max-bytes N (default 16384)
-  --grep TEXT   (lines of each matched file containing TEXT; -i folds case)   --max-hits N (default 20)
+  --grep TEXT   (lines of each matched file containing TEXT; -i folds case)   --grep-re RE (a regular expression)
+  --max-hits N  (default 20 per file)
 
 LARGE OPERATIONS
   above --plan-files N (default 1000) or --plan-bytes S (default 10G) a move or recycle writes a PLAN and stops
@@ -131,6 +132,8 @@ struct Args {
     lines: Option<(usize, usize)>,
     max_bytes: usize,
     grep: Option<String>,
+    grep_re: Option<String>,
+    regexes: Vec<String>,
     max_hits: usize,
     copy_to: Option<PathBuf>,
     move_to: Option<PathBuf>,
@@ -236,6 +239,8 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             }
             "--max-bytes" => a.max_bytes = units::parse_size(&val("--max-bytes")?)? as usize,
             "--grep" => a.grep = Some(val("--grep")?),
+            "--grep-re" => a.grep_re = Some(val("--grep-re")?),
+            "--regex" => a.regexes.push(val("--regex")?),
             "--max-hits" => a.max_hits = num(val("--max-hits")?, "--max-hits")?,
             "--copy-to" => a.copy_to = Some(PathBuf::from(val("--copy-to")?)),
             "--move-to" => a.move_to = Some(PathBuf::from(val("--move-to")?)),
@@ -251,6 +256,9 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--rounds" => a.rounds = num(val("--rounds")?, "--rounds")?.max(1),
             x => return Err(format!("unknown option {x} (--help lists them)")),
         }
+    }
+    for r in a.regexes.iter().chain(a.grep_re.iter()) {
+        regex::RegexBuilder::new(r).build().map_err(|e| format!("not a regular expression: {r}: {e}"))?;
     }
     let acts = [a.copy_to.is_some(), a.move_to.is_some(), a.recycle].iter().filter(|x| **x).count();
     if acts > 1 {
@@ -328,6 +336,7 @@ fn make_filter(a: &Args, t: u64) -> walk::Filter {
     }
     walk::Filter {
         names: a.names.iter().map(|n| glob::Glob::new(n, a.ignore_case)).collect(),
+        regexes: a.regexes.iter().map(|r| re(r, a.ignore_case)).collect(),
         exts: a.exts.clone(),
         min: a.min,
         max: a.max,
@@ -335,6 +344,11 @@ fn make_filter(a: &Args, t: u64) -> walk::Filter {
         older: a.older.map(|d| t.saturating_sub(d.as_secs())),
         kinds,
     }
+}
+
+/// checked in parse(), so it compiles here
+fn re(r: &str, ignore_case: bool) -> regex::Regex {
+    regex::RegexBuilder::new(r).case_insensitive(ignore_case).build().expect("checked in parse")
 }
 
 fn opts(a: &Args, finding: bool) -> walk::Opts {
@@ -468,7 +482,7 @@ fn root_json(rep: &walk::Report, abs: &Path, secs: f64, a: &Args) -> Value {
 /// Found entries to the next step: text, paths, NUL-separated, a format, JSON lines; then the lines asked for.
 fn emit_found(v: &[walk::Found], a: &Args, out: &mut String) {
     use std::io::Write;
-    let reading = a.head.is_some() || a.tail.is_some() || a.lines.is_some() || a.grep.is_some();
+    let reading = a.head.is_some() || a.tail.is_some() || a.lines.is_some() || a.grep.is_some() || a.grep_re.is_some();
     let mut stdout = std::io::stdout().lock();
     for f in v {
         if a.print0 {
@@ -527,6 +541,16 @@ fn read_text(p: &Path, a: &Args) -> String {
             Err(e) => s.push_str(&format!("    (unreadable: {e})\n")),
         }
     }
+    if let Some(r) = &a.grep_re {
+        match content::grep_re(p, &re(r, a.ignore_case), a.max_hits, 300) {
+            Ok(hits) => {
+                for (n, l) in hits {
+                    s.push_str(&format!("    {n:>6}: {l}\n"));
+                }
+            }
+            Err(e) => s.push_str(&format!("    (unreadable: {e})\n")),
+        }
+    }
     if let Some(pk) = pick(a) {
         match content::lines(p, &pk, a.max_bytes) {
             Ok((ls, cut)) => {
@@ -550,6 +574,12 @@ fn read_json(p: &Path, a: &Args) -> Value {
     let mut v = json!({});
     if let Some(needle) = &a.grep {
         v["grep"] = match content::grep(p, needle, a.ignore_case, a.max_hits, 300) {
+            Ok(h) => Value::Array(h.into_iter().map(|(n, l)| json!({"line": n, "text": l})).collect()),
+            Err(e) => json!({"error": e.to_string()}),
+        };
+    }
+    if let Some(r) = &a.grep_re {
+        v["grep"] = match content::grep_re(p, &re(r, a.ignore_case), a.max_hits, 300) {
             Ok(h) => Value::Array(h.into_iter().map(|(n, l)| json!({"line": n, "text": l})).collect()),
             Err(e) => json!({"error": e.to_string()}),
         };

@@ -119,6 +119,33 @@ pub fn grep(path: &Path, needle: &str, ignore_case: bool, max_hits: usize, max_l
     Ok(out)
 }
 
+/// Lines matching the regular expression `re`, at most `max_hits` per file.
+pub fn grep_re(path: &Path, re: &regex::Regex, max_hits: usize, max_line: usize) -> std::io::Result<Vec<(usize, String)>> {
+    let mut r = BufReader::new(File::open(path)?);
+    let mut buf = Vec::new();
+    let (mut n, mut out) = (0usize, Vec::new());
+    loop {
+        buf.clear();
+        if r.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        n += 1;
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim_end_matches(['\n', '\r']);
+        if re.is_match(line) {
+            let mut l: String = line.chars().take(max_line).collect();
+            if line.chars().count() > max_line {
+                l.push_str(" ...");
+            }
+            out.push((n, l));
+            if out.len() >= max_hits {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// true when the two files hold the same bytes (sizes first, then 1 MiB blocks).
 pub fn same_bytes(a: &Path, b: &Path) -> std::io::Result<bool> {
     let (ma, mb) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
