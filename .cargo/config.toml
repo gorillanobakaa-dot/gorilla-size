@@ -1,0 +1,18 @@
+# Build only from vendor/: no registry, no network. `cargo build --release --offline --locked`.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+
+[net]
+offline = true
+
+# One file that runs on any Windows PC: the C runtime is linked in (no Visual C++ Redistributable needed).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Linux: build for x86_64-unknown-linux-musl to get one static file that runs on any distribution.
