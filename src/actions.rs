@@ -410,10 +410,16 @@ mod bin {
                                     a smaller batch", crate::units::human(used), mb, crate::units::human(bytes)));
             }
         }
-        let lp = longest_path(p);
+        // What counts is the length INSIDE the bin, where Explorer must be able to empty or restore the item:
+        // C:\$Recycle.Bin\<SID>\$RXXXXXX<ext> replaces the item's own path. 2026-10-16: leak-gate runs with
+        // 293-character paths were refused by the old rule (written for SHFileOperation, which may destroy such
+        // items); moved by rename they sit at about 240 characters in the bin.
+        let in_bin_prefix = bin_dir(p)?.as_os_str().len() + 1 + 8
+            + p.extension().map(|e| e.len() + 1).unwrap_or(0);
+        let lp = longest_path(p) - p.as_os_str().len() + in_bin_prefix;
         if lp > 259 {
-            return Err(format!("a path inside is {lp} characters long; the Recycle Bin cannot take paths over 259, \
-                                and Windows may delete instead"));
+            return Err(format!("a path inside would be {lp} characters long in the Recycle Bin; Explorer cannot \
+                                empty or restore paths over 259 there. Move it to a shorter place first"));
         }
         Ok(())
     }

@@ -242,8 +242,10 @@ fn a_plan_whose_files_changed_is_not_applied_to_them() {
 #[test]
 fn a_path_too_long_for_the_bin_is_refused_before_anything_is_touched() {
     let t = tmp("long");
-    let mut deep = t.0.join("long");
-    while deep.as_os_str().len() < 280 {
+    let item = t.0.join("long");
+    let mut deep = item.clone();
+    // deep enough that even INSIDE the bin (a ~60-character prefix) the path passes 259 characters
+    while deep.as_os_str().len() - item.as_os_str().len() < 230 {
         deep = deep.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     }
     let wide = format!(r"\\?\{}", deep.display());
@@ -254,6 +256,32 @@ fn a_path_too_long_for_the_bin_is_refused_before_anything_is_touched() {
     assert!(out.contains("REFUSED, nothing touched") && out.contains("259"), "{out}");
     assert!(t.0.join("long").exists());
     let _ = fs::remove_dir_all(format!(r"\\?\{}", t.0.display()));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_long_path_that_is_short_inside_the_bin_is_recycled_and_restored() {
+    // 2026-10-16: leak-gate runs with 293-character paths, about 240 characters once in the bin
+    if !bin_available() {
+        return;
+    }
+    let t = tmp("longok");
+    let mut base = t.0.clone();
+    while base.as_os_str().len() < 200 {
+        base = base.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    }
+    let item = base.join("run");
+    let deep = item.join("cccccccccccccccccccccccccccccccccccccccccccccccc").join("ddddddddddddd.pcapng");
+    let wide = |p: &Path| format!(r"\\?\{}", p.display());
+    fs::create_dir_all(wide(deep.parent().unwrap())).unwrap();
+    fs::write(wide(&deep), b"capture").unwrap();
+    assert!(deep.as_os_str().len() > 259, "the test needs an original path over 259");
+    let v = json(&["recycle", s(&item)]);
+    assert_eq!(v["failed"], 0, "{v}");
+    let u = json(&["undo", v["journal"].as_str().unwrap()]);
+    assert_eq!(u["failed"], 0, "{u}");
+    assert_eq!(fs::read(wide(&deep)).unwrap(), b"capture");
+    let _ = fs::remove_dir_all(wide(&t.0));
 }
 
 #[test]
