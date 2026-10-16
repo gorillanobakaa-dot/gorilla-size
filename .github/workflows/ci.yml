@@ -24,3 +24,7 @@ jobs:
       - run: rustup target add x86_64-unknown-linux-musl
       - run: cargo build --release --offline --locked --target x86_64-unknown-linux-musl
       - run: ./target/x86_64-unknown-linux-musl/release/gorilla-size --version
+      - run: ./target/x86_64-unknown-linux-musl/release/gorilla-trash --version
+      # the static binary on the real runner: measure a real tree, list the real (empty) trash
+      - run: ./target/x86_64-unknown-linux-musl/release/gorilla-size /usr -d 1 -n 5
+      - run: ./target/x86_64-unknown-linux-musl/release/gorilla-trash list

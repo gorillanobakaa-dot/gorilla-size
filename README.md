@@ -146,7 +146,13 @@ find ... --copy-to DIR | --move-to DIR | --recycle                            go
 - **Large operations:** a move or recycle above 1,000 files or 10 GiB (`--plan-files`, `--plan-bytes`) is **held**:
   the tool writes a plan file and stops (exit 4). Review it, then `gorilla-size apply PLAN`, which skips anything that
   changed since the plan was written. `--plan` writes one on purpose. Copies are never held.
-- **There is no permanent delete.** Emptying the Recycle Bin stays a person's decision.
+- **There is no permanent delete in gorilla-size.** `gorilla-size trash list` shows what is in the Recycle Bin
+  (original place, size, date) and `gorilla-size trash restore NAME` puts something back.
+- **Emptying the bin is a separate program, `gorilla-trash`, for a person to run.** `gorilla-trash list` shows what
+  is in it and the number to confirm with; `gorilla-trash empty --confirm N` deletes everything in it **for good**,
+  on every core, only when N equals the number of items there right now (look first; nobody empties by accident).
+  Read-only files are made writable first; a junction or symlink inside an item is removed as a link and the folder
+  it points to is never touched (tested). Why: Explorer emptied 1,038,326 items one by one at about 2,700 per second.
 
 ## 7. The machine profile
 

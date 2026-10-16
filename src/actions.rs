@@ -520,13 +520,23 @@ mod bin {
         Err("no free name in the Recycle Bin; nothing touched".into())
     }
 
+    /// This account's Recycle Bin folder on every drive that has one.
+    pub fn dirs() -> Vec<PathBuf> {
+        let Ok(sid) = sid() else { return vec![] };
+        (b'A'..=b'Z').map(|l| PathBuf::from(format!("{}:\\$Recycle.Bin\\{sid}", l as char))).filter(|d| d.is_dir())
+            .collect()
+    }
+
     /// Everything in this account's Recycle Bin on every drive, from the bin's own $I records.
     pub fn list() -> Vec<super::BinItem> {
-        let Ok(sid) = sid() else { return vec![] };
+        dirs().iter().flat_map(|d| list_dir(d)).collect()
+    }
+
+    /// The items of one bin folder ($I records and their $R items).
+    pub fn list_dir(dir: &Path) -> Vec<super::BinItem> {
         let mut out = Vec::new();
-        for l in b'A'..=b'Z' {
-            let dir = PathBuf::from(format!("{}:\\$Recycle.Bin\\{sid}", l as char));
-            let Ok(rd) = fs::read_dir(&dir) else { continue };
+        {
+            let Ok(rd) = fs::read_dir(dir) else { return out };
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let Some(rest) = name.strip_prefix("$I") else { continue };
@@ -697,9 +707,17 @@ mod bin {
         String::from_utf8_lossy(&out).into_owned()
     }
 
+    pub fn dirs() -> Vec<PathBuf> {
+        trash().filter(|t| t.is_dir()).into_iter().collect()
+    }
+
     /// Everything in the freedesktop trash, from its .trashinfo records.
     pub fn list() -> Vec<super::BinItem> {
-        let Some(t) = trash() else { return vec![] };
+        dirs().iter().flat_map(|d| list_dir(d)).collect()
+    }
+
+    /// The items of one trash folder (its info/*.trashinfo records and files/).
+    pub fn list_dir(t: &Path) -> Vec<super::BinItem> {
         let Ok(rd) = fs::read_dir(t.join("info")) else { return vec![] };
         let mut out = Vec::new();
         for e in rd.flatten() {
@@ -732,6 +750,26 @@ impl BinItem {
     pub fn orphan(&self) -> bool {
         std::fs::symlink_metadata(&self.item).is_err()
     }
+
+    /// the bin's record of this item: $I... beside $R... (Windows), info/NAME.trashinfo (freedesktop)
+    pub fn record(&self) -> PathBuf {
+        let name = self.item.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match name.strip_prefix("$R") {
+            Some(rest) => self.item.with_file_name(format!("$I{rest}")),
+            None => self.item.parent().and_then(|f| f.parent()).unwrap_or(Path::new(""))
+                .join("info").join(format!("{name}.trashinfo")),
+        }
+    }
+}
+
+/// The Recycle Bin folders of this account (Windows: one per drive) or the trash folder (freedesktop).
+pub fn bin_dirs() -> Vec<PathBuf> {
+    bin::dirs()
+}
+
+/// The items of one bin folder given by path (used by gorilla-trash, and by its tests on a made-up bin).
+pub fn bin_list_in(dir: &Path) -> Vec<BinItem> {
+    bin::list_dir(dir)
 }
 
 pub fn bin_list() -> Vec<BinItem> {

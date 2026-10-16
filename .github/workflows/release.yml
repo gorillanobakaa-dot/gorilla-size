@@ -26,7 +26,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: target/release/gorilla-size.exe
+          path: |
+            target/release/gorilla-size.exe
+            target/release/gorilla-trash.exe
   linux:
     needs: test
     runs-on: ubuntu-latest
@@ -37,7 +39,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: target/x86_64-unknown-linux-musl/release/gorilla-size
+          path: |
+            target/x86_64-unknown-linux-musl/release/gorilla-size
+            target/x86_64-unknown-linux-musl/release/gorilla-trash
   publish:
     needs: [windows, linux]
     runs-on: ubuntu-latest
@@ -55,8 +59,10 @@ jobs:
         run: |
           mkdir out
           cp windows/gorilla-size.exe out/gorilla-size-windows-x86_64.exe
+          cp windows/gorilla-trash.exe out/gorilla-trash-windows-x86_64.exe
           cp linux/gorilla-size out/gorilla-size-linux-x86_64
-          chmod +x out/gorilla-size-linux-x86_64
+          cp linux/gorilla-trash out/gorilla-trash-linux-x86_64
+          chmod +x out/gorilla-size-linux-x86_64 out/gorilla-trash-linux-x86_64
           cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS
       - env:
           GH_TOKEN: ${{ github.token }}

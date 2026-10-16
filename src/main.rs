@@ -5,21 +5,8 @@
 //! delete; never the network. Born 2026-10-16: `du` ran 25 minutes on one Firefox tree of 480,000 files and was
 //! stopped, a hand-typed robocopy line got the numbers, and a "Recycle Bin" call destroyed a folder instead.
 
-mod actions;
-mod compare;
-mod content;
-mod extra;
-mod fastdir;
-mod glob;
-mod ignore;
-mod mft;
-mod os;
-mod output;
-mod profile;
-mod sha256;
-mod units;
-mod walk;
 
+use gorilla_size::{actions, compare, content, extra, glob, mft, output, profile, units, walk};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
