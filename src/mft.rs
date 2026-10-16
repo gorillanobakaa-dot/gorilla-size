@@ -241,6 +241,8 @@ mod imp {
             return Err("needs administrator rights (the volume is read raw). Run it from an administrator \
                         prompt, or let Fieldkit ask once: fieldkit size --mft <path> (one UAC click)".into());
         }
+        let long = win::long_path(path);
+        let path = long.as_path();
         let letter = drive_letter(path).ok_or("give a path on a lettered drive, like C:\\Users")?;
         let dev: Vec<u16> = format!(r"\\.\{letter}:").encode_utf16().chain(Some(0)).collect();
         const GENERIC_READ: u32 = 0x8000_0000;

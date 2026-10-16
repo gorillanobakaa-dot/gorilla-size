@@ -44,9 +44,17 @@ impl Journal {
     pub fn open(op: &str) -> std::io::Result<Journal> {
         let d = state_dir().join("journal");
         fs::create_dir_all(&d)?;
-        let path = d.join(format!("{}-{op}.jsonl", stamp()));
-        let f = fs::OpenOptions::new().create_new(true).append(true).open(&path)?;
-        Ok(Journal { path, f })
+        // milliseconds are not unique on a fast machine (2026-10-16, Linux CI: "File exists"): process id and a
+        // counter, and an existing journal is never reused
+        for k in 0..1000 {
+            let path = d.join(format!("{}-{}-{k}-{op}.jsonl", stamp(), std::process::id()));
+            match fs::OpenOptions::new().create_new(true).append(true).open(&path) {
+                Ok(f) => return Ok(Journal { path, f }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free journal name"))
     }
     pub fn write(&mut self, v: &Value) -> std::io::Result<()> {
         writeln!(self.f, "{v}")?;

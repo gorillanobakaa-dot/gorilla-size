@@ -220,6 +220,24 @@ pub mod win {
         Some(buf)
     }
 
+    /// The long form of a path: `C:\Users\<SHORT~1>\...` -> `C:\Users\<long name>\...`. 2026-10-16 (CI): --mft looks
+    /// names up in the master file table by their long names, and a temp path holding an 8.3 short name was "not on
+    /// C:". Unchanged when Windows cannot tell (the path does not exist).
+    pub fn long_path(p: &Path) -> std::path::PathBuf {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetLongPathNameW(short: *const u16, long: *mut u16, len: u32) -> u32;
+        }
+        let w = wide(p);
+        let mut buf = vec![0u16; 32768];
+        let n = unsafe { GetLongPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 || n >= buf.len() {
+            return p.to_path_buf();
+        }
+        let s = String::from_utf16_lossy(&buf[..n]);
+        std::path::PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+    }
+
     pub fn cluster_size(p: &Path) -> Option<u64> {
         let root = volume_root(p)?;
         let (mut spc, mut bps, mut f, mut t) = (0u32, 0u32, 0u32, 0u32);
