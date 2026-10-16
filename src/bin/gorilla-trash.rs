@@ -2,10 +2,15 @@
 //! gorilla-trash - empty the Recycle Bin (Windows) or the trash (Linux) on every core.
 //!
 //! This is the ONE program here that deletes for good, so it is a separate file from gorilla-size (which never
-//! does) and it only empties when told the exact number of items it is about to destroy:
+//! does):
 //!
-//!     gorilla-trash list                      what is in it, and the number to confirm with
-//!     gorilla-trash empty --confirm N         N must equal the number of items in the bin right now
+//!     gorilla-trash empty                     at a terminal: shows the items and asks once (y/N)
+//!     gorilla-trash empty --confirm N         without a terminal (agents, scripts): N must equal the items there
+//!     gorilla-trash list                      what is in it
+//!
+//! It deletes exactly the items it showed (or counted), never one that arrived afterwards. 2026-10-16, the owner:
+//! a separate `list` then `empty --confirm N` "makes the tool not safer, it only created a second tool call" for a
+//! person; the count stays only where nobody can answer a question.
 //!
 //! Born 2026-10-16: Explorer emptied 1,038,326 items at about 2,700 per second (over 20 minutes), one by one.
 //! Here every item, and every folder inside it, is deleted in parallel; read-only files are made writable first;
@@ -25,8 +30,9 @@ use rayon::prelude::*;
 const HELP: &str = "\
 gorilla-trash - empty the Recycle Bin (Windows) or the trash (Linux) on every core. DELETES FOR GOOD.
 
-  gorilla-trash list                    what is in it, its size, and the number to confirm with
-  gorilla-trash empty --confirm N       delete everything in it; N must be the item count shown by `list`
+  gorilla-trash empty                   at a terminal: shows what is in it and asks once [y/N]
+  gorilla-trash empty --confirm N       without a terminal (agents, scripts): N must be the item count there now
+  gorilla-trash list                    what is in it and its size
   --json                                machine-readable
   --bin-dir DIR                         one bin folder instead of this account's (for tests on a made-up bin)
 
@@ -141,7 +147,8 @@ fn main() -> ExitCode {
         Some(d) => vec![PathBuf::from(d)],
         None => actions::bin_dirs(),
     };
-    let items: Vec<BinItem> = dirs.iter().flat_map(|d| actions::bin_list_in(d)).collect();
+    let mut items: Vec<BinItem> = dirs.iter().flat_map(|d| actions::bin_list_in(d)).collect();
+    items.sort_by(|a, b| b.deleted.cmp(&a.deleted).then_with(|| a.original.cmp(&b.original)));
     let real: Vec<&BinItem> = items.iter().filter(|i| !i.orphan()).collect();
     let bytes: u64 = real.iter().map(|i| i.bytes).sum();
     match args[0].as_str() {
@@ -153,20 +160,44 @@ fn main() -> ExitCode {
                 for i in &real {
                     println!("{:>10}  {}  {}", units::human(i.bytes), output::date(i.deleted), i.original);
                 }
-                println!("{} item(s), {}. To delete them FOR GOOD: gorilla-trash empty --confirm {}", real.len(),
-                         units::human(bytes), real.len());
+                println!("{} item(s), {}", real.len(), units::human(bytes));
             }
             ExitCode::SUCCESS
         }
         "empty" => {
-            let Some(n) = value("--confirm").and_then(|v| v.parse::<usize>().ok()) else {
-                eprintln!("gorilla-trash empty: say how many items you are deleting: --confirm N (gorilla-trash list)");
-                return ExitCode::from(2);
-            };
-            if n != real.len() {
-                eprintln!("REFUSED: the bin holds {} item(s), not {n}. Nothing deleted. Look again: gorilla-trash list",
-                          real.len());
-                return ExitCode::from(4);
+            use std::io::{BufRead, IsTerminal, Write};
+            if real.is_empty() && items.is_empty() {
+                println!("the bin is already empty");
+                return ExitCode::SUCCESS;
+            }
+            match value("--confirm").map(|v| v.parse::<usize>()) {
+                Some(Ok(n)) if n == real.len() => {}
+                Some(Ok(n)) => {
+                    eprintln!("REFUSED: the bin holds {} item(s), not {n}. Nothing deleted.", real.len());
+                    return ExitCode::from(4);
+                }
+                Some(Err(_)) => {
+                    eprintln!("gorilla-trash empty: --confirm takes the number of items");
+                    return ExitCode::from(2);
+                }
+                None if std::io::stdin().is_terminal() => {
+                    for i in &real {
+                        println!("{:>10}  {}  {}", units::human(i.bytes), output::date(i.deleted), i.original);
+                    }
+                    print!("Delete these {} item(s), {}, FOR GOOD? [y/N] ", real.len(), units::human(bytes));
+                    let _ = std::io::stdout().flush();
+                    let mut answer = String::new();
+                    let _ = std::io::stdin().lock().read_line(&mut answer);
+                    if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+                        println!("nothing deleted");
+                        return ExitCode::from(4);
+                    }
+                }
+                None => {
+                    eprintln!("REFUSED: no terminal to ask (an agent or a script). Nothing deleted. Give the number of \
+                               items you mean to destroy: --confirm {}", real.len());
+                    return ExitCode::from(4);
+                }
             }
             let t = Tally { files: AtomicU64::new(0), dirs: AtomicU64::new(0), bytes: AtomicU64::new(0),
                             errors: Mutex::new(Vec::new()) };

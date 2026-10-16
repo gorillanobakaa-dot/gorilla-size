@@ -83,8 +83,11 @@ fn empties_only_with_the_right_count_and_never_follows_a_link() {
     assert_eq!(v["items"], 2);
     assert_eq!(v["orphan_records"], 1);
 
+    // run() has no terminal on stdin, like an agent: without --confirm it must refuse, not ask
     let (rc, _, err) = run(&["empty", "--bin-dir", bin.to_str().unwrap()]);
-    assert_eq!(rc, 2, "no --confirm: {err}");
+    assert_eq!(rc, 4, "no terminal and no --confirm must refuse: {err}");
+    assert!(err.contains("no terminal"), "{err}");
+    assert!(a.exists() && b.exists(), "nothing deleted on a refusal");
     let (rc, _, err) = run(&["empty", "--confirm", "3", "--bin-dir", bin.to_str().unwrap()]);
     assert_eq!(rc, 4, "wrong count must refuse: {err}");
     assert!(a.exists() && b.exists(), "nothing deleted on a refusal");
