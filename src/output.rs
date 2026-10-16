@@ -31,10 +31,14 @@ pub fn text(rep: &Report, st: &Style, out: &mut String) {
     let root = &rep.root;
     let total = root.bytes.max(1) as f64;
     let size = |n: &Node| if st.disk { n.disk } else { n.bytes };
-    out.push_str(&format!("{:>10} {:>6}  {}  {}{}   {} files, {} folders\n", human(size(root)), "100%",
-                          bar(1.0, st.width, st.ascii), root.name, kind_mark(root), count(root.files),
-                          count(root.dirs)));
+    out.push_str(&format!("{:>10} {:>6}  {}  {}{}   {}, {}\n", human(size(root)), "100%",
+                          bar(1.0, st.width, st.ascii), root.name, kind_mark(root),
+                          plural(root.files, "file", "files"), plural(root.dirs, "folder", "folders")));
     tree(root, "", 1, st, total, out);
+}
+
+fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{} {}", count(n), if n == 1 { one } else { many })
 }
 
 fn tree(n: &Node, prefix: &str, level: usize, st: &Style, total: f64, out: &mut String) {
@@ -48,7 +52,7 @@ fn tree(n: &Node, prefix: &str, level: usize, st: &Style, total: f64, out: &mut 
     for (i, c) in n.children[..shown].iter().enumerate() {
         let last = i + 1 == shown && rest.is_empty();
         let frac = size(c) as f64 / total;
-        let extra = if c.kind == Kind::Dir { format!("   {} files", count(c.files)) } else { String::new() };
+        let extra = if c.kind == Kind::Dir { format!("   {}", plural(c.files, "file", "files")) } else { String::new() };
         out.push_str(&format!("{:>10} {:>5.1}%  {}  {}{}{}{}{}\n", human(size(c)), frac * 100.0,
                               bar(frac, st.width, st.ascii), prefix, if last { ell } else { tee }, c.name,
                               kind_mark(c), extra));
@@ -161,6 +165,13 @@ mod tests {
         assert_eq!(date(Some(0)), "1970-01-01");
         assert_eq!(date(Some(1_792_108_800)), "2026-10-16");
         assert_eq!(date(Some(951_782_400)), "2000-02-29");
+    }
+
+    #[test]
+    fn one_file_is_not_files() {
+        assert_eq!(plural(1, "file", "files"), "1 file");
+        assert_eq!(plural(1200, "file", "files"), "1,200 files");
+        assert_eq!(plural(0, "folder", "folders"), "0 folders");
     }
 
     #[test]
