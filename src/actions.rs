@@ -500,7 +500,7 @@ mod bin {
         fn the_bins_records_are_read_in_both_formats() {
             let d = std::env::temp_dir().join(format!("gs-ifile-{}", std::process::id()));
             fs::create_dir_all(&d).unwrap();
-            let path = r"C:\Users\x\Documents\old.zip";
+            let path = r"D:\Work\archive\old.zip";
             let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
             let mut v2 = Vec::new();
             v2.extend(2u64.to_le_bytes());
