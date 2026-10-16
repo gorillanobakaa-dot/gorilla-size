@@ -132,11 +132,15 @@ find ... --copy-to DIR | --move-to DIR | --recycle                            go
   `--overwrite`, which first moves the old one aside (`name.gorilla-bak-<time>`), never destroys it.
 - **move:** on the same drive a rename, checked; across drives a verified copy and then a verified recycle of the
   source.
-- **recycle:** to the Windows Recycle Bin or the freedesktop trash (Linux). On Windows it is **refused before
-  anything is touched** when Windows would destroy instead of recycle: a drive without a Recycle Bin (USB sticks,
-  network shares), a drive set to delete immediately, an item bigger than the bin, a bin that would have to throw
-  away its oldest items to make room, or a path longer than 259 characters. After the action, the item must be found
-  in the **bin's own records**; if it left its place and is not there, the tool stops and says so in capitals.
+- **recycle:** to the Windows Recycle Bin or the freedesktop trash (Linux). On Windows the tool **does not ask
+  Windows to recycle**: it writes the item's Recycle Bin record (`$I…`) and then **renames** the item into the bin
+  (`$R…`), exactly what Explorer does. A rename cannot destroy anything; if it fails, the item stays where it was.
+  Explorer shows the item in the bin with its name, original location and date, and can restore it. Why: on
+  2026-10-16 the usual Windows call (`SHFileOperation`, "allow undo") deleted folders **permanently** instead of
+  recycling them, once on a laptop and three times on GitHub's Windows runner, after every check had passed. It is
+  **refused before anything is touched** when the account has no Recycle Bin on that drive (USB sticks, network
+  shares, a machine where nothing was ever deleted), the drive is set to delete immediately, the item is bigger than
+  the bin, the bin would have to purge older items to make room, or a path is longer than 259 characters.
 - **undo:** every action writes a journal (`%LOCALAPPDATA%\gorilla\journal`, `~/.local/state/gorilla/journal`);
   `undo` reverses it: copies are recycled, moves go back, recycled items are restored.
 - **Large operations:** a move or recycle above 1,000 files or 10 GiB (`--plan-files`, `--plan-bytes`) is **held**:

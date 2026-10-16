@@ -295,22 +295,6 @@ mod bin {
 
     use crate::os::win::{self, CloseHandle, Handle};
 
-    #[repr(C)]
-    struct FileOp {
-        hwnd: *mut c_void,
-        func: u32,
-        from: *const u16,
-        to: *const u16,
-        flags: u16,
-        aborted: i32,
-        mappings: *mut c_void,
-        title: *const u16,
-    }
-
-    #[link(name = "shell32")]
-    extern "system" {
-        fn SHFileOperationW(op: *mut FileOp) -> i32;
-    }
     #[link(name = "kernel32")]
     extern "system" {
         fn GetDriveTypeW(root: *const u16) -> u32;
@@ -456,41 +440,78 @@ mod bin {
         Ok(PathBuf::from(root(p)?).join("$Recycle.Bin").join(sid()?))
     }
 
-    fn find_in_bin(p: &Path, since: std::time::SystemTime) -> Result<Option<PathBuf>, String> {
-        let dir = bin_dir(p)?;
-        let want = p.display().to_string().to_lowercase();
-        let rd = fs::read_dir(&dir).map_err(|e| format!("cannot read the Recycle Bin ({}): {e}", dir.display()))?;
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if !name.starts_with("$I") {
-                continue;
-            }
-            let fresh = e.metadata().and_then(|m| m.modified()).map(|t| t >= since).unwrap_or(false);
-            if fresh && original_of(&e.path()).map(|o| o.to_lowercase()) == Some(want.clone()) {
-                return Ok(Some(dir.join(format!("$R{}", &name[2..]))));
-            }
-        }
-        Ok(None)
+    /// The bin's record of one item, version 2 (Windows 10 and later): header, size, deletion time, path length in
+    /// characters including the final NUL, the original path in UTF-16.
+    fn i_record(original: &Path, bytes: u64) -> Vec<u8> {
+        let ft = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() / 100)
+            .unwrap_or(0) as u64 + 116_444_736_000_000_000;
+        let wide: Vec<u16> = original.as_os_str().to_string_lossy().encode_utf16().chain(Some(0)).collect();
+        let mut v = Vec::with_capacity(28 + wide.len() * 2);
+        v.extend(2u64.to_le_bytes());
+        v.extend(bytes.to_le_bytes());
+        v.extend(ft.to_le_bytes());
+        v.extend((wide.len() as u32).to_le_bytes());
+        v.extend(wide.iter().flat_map(|c| c.to_le_bytes()));
+        v
     }
 
+    fn token(k: u32) -> String {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        h.write_u32(k);
+        h.write_u32(std::process::id());
+        let mut x = h.finish();
+        (0..6).map(|_| {
+            let c = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[(x % 36) as usize] as char;
+            x /= 36;
+            c
+        }).collect()
+    }
+
+    /// Recycle by doing what Explorer does, without asking Windows to: write the item's $I record, then RENAME the
+    /// item into $Recycle.Bin\<SID>\ as $R. A rename cannot destroy anything; if it fails the item stays where it
+    /// was. 2026-10-16: on GitHub's Windows runner SHFileOperation (FOF_ALLOWUNDO) passed every pre-check and still
+    /// deleted three test folders permanently, the same failure that cost 157.0-clean that morning on this laptop.
     pub fn send(p: &Path) -> Result<PathBuf, String> {
-        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(2);
-        let mut from: Vec<u16> = p.as_os_str().to_string_lossy().encode_utf16().collect();
-        from.extend([0, 0]);
-        const FO_DELETE: u32 = 3;
-        const FLAGS: u16 = 0x40 | 0x10 | 0x4 | 0x400; // ALLOWUNDO NOCONFIRMATION SILENT NOERRORUI
-        let mut op = FileOp { hwnd: std::ptr::null_mut(), func: FO_DELETE, from: from.as_ptr(), to: std::ptr::null(),
-                              flags: FLAGS, aborted: 0, mappings: std::ptr::null_mut(), title: std::ptr::null() };
-        let rc = unsafe { SHFileOperationW(&mut op) };
-        if rc != 0 || op.aborted != 0 {
-            return Err(format!("Windows refused (code {rc:#x}); nothing was recycled"));
+        let dir = bin_dir(p)?;
+        if !dir.is_dir() {
+            return Err(format!("this account has no Recycle Bin folder on that drive ({}); nothing touched",
+                               dir.display()));
         }
-        match find_in_bin(p, since)? {
-            Some(item) if item.exists() => Ok(item),
-            _ if p.exists() => Err("Windows reported success but the item is still in place; not recycled".into()),
-            _ => Err("PERMANENTLY DELETED BY WINDOWS: it left its place and is NOT in the Recycle Bin. Stop and tell \
-                      the person.".into()),
+        let (_, bytes) = super::tally(p);
+        let ext = match (p.is_dir(), p.extension()) {
+            (false, Some(e)) => format!(".{}", e.to_string_lossy()),
+            _ => String::new(),
+        };
+        for k in 0..100 {
+            let id = token(k);
+            let (r, i) = (dir.join(format!("$R{id}{ext}")), dir.join(format!("$I{id}{ext}")));
+            if r.exists() || i.exists() {
+                continue;
+            }
+            let mut f = match fs::OpenOptions::new().write(true).create_new(true).open(&i) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("cannot write the Recycle Bin's record: {e}; nothing touched")),
+            };
+            use std::io::Write;
+            if let Err(e) = f.write_all(&i_record(p, bytes)).and_then(|_| f.sync_all()) {
+                drop(f);
+                let _ = fs::remove_file(&i); // our own record, just written: the item was not touched
+                return Err(format!("cannot write the Recycle Bin's record: {e}; nothing touched"));
+            }
+            drop(f);
+            return match fs::rename(p, &r) {
+                Ok(()) if r.exists() && !p.exists() && original_of(&i).as_deref() == Some(&*p.to_string_lossy()) => Ok(r),
+                Ok(()) => Err(format!("moved to {} but the check after it failed: look there", r.display())),
+                Err(e) => {
+                    let _ = fs::remove_file(&i);
+                    Err(format!("could not move it into the Recycle Bin ({e}); nothing touched"))
+                }
+            };
         }
+        Err("no free name in the Recycle Bin; nothing touched".into())
     }
 
     pub fn restore(item: &Path, original: &Path) -> Result<(), String> {
@@ -512,6 +533,19 @@ mod bin {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn the_record_we_write_is_the_record_windows_reads() {
+            let d = std::env::temp_dir().join(format!("gs-irec-{}", std::process::id()));
+            fs::create_dir_all(&d).unwrap();
+            let original = Path::new(r"D:\Work\big folder\ünïcode.zip");
+            fs::write(d.join("$Itest"), i_record(original, 12345)).unwrap();
+            assert_eq!(original_of(&d.join("$Itest")).as_deref(), Some(r"D:\Work\big folder\ünïcode.zip"));
+            let b = fs::read(d.join("$Itest")).unwrap();
+            assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 12345);
+            assert_ne!(token(1), token(1), "two names drawn in a row differ");
+            fs::remove_dir_all(&d).unwrap();
+        }
 
         #[test]
         fn the_bins_records_are_read_in_both_formats() {

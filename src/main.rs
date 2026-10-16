@@ -57,6 +57,8 @@ ACT (verified, journalled, undoable; never a permanent delete)
   find ... --copy-to DIR | --move-to DIR | --recycle    the same, on what find matched
 
 MACHINE
+  gorilla-size bench A B [--rounds N] -- ARGS   two programs, same ARGS, alternating; a verdict only when the
+                                           middle halves of the runs do not overlap, else INCONCLUSIVE
   gorilla-size profile                     this machine and the calibrated thread count per disk
   gorilla-size profile --recalibrate [SAMPLE] [--rounds N]   measure 1..N threads on SAMPLE, keep the fastest
 
@@ -149,8 +151,8 @@ struct Args {
     rounds: usize,
 }
 
-const MODES: [&str; 18] = ["find", "compare", "types", "newest", "oldest", "watch", "free", "hash", "dupes", "empty",
-                           "reparse", "copy", "move", "recycle", "undo", "apply", "profile", "report"];
+const MODES: [&str; 19] = ["find", "compare", "types", "newest", "oldest", "watch", "free", "hash", "dupes", "empty",
+                           "reparse", "copy", "move", "recycle", "undo", "apply", "profile", "report", "bench"];
 
 fn parse(argv: Vec<String>) -> Result<Args, String> {
     let mut a = Args { mode: "report".into(), depth: 1, sort: "size".into(), max_bytes: 16384, max_hits: 20,
@@ -276,7 +278,15 @@ fn absolute(p: &Path) -> PathBuf {
 }
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // bench: everything after `--` belongs to the two programs, not to gorilla-size
+    let mut bench_args = Vec::new();
+    if argv.first().map(|s| s.as_str()) == Some("bench") {
+        if let Some(i) = argv.iter().position(|x| x == "--") {
+            bench_args = argv.split_off(i + 1);
+            argv.pop();
+        }
+    }
     let a = match parse(argv) {
         Ok(a) => a,
         Err(e) if e == "HELP" => {
@@ -310,6 +320,7 @@ fn main() -> ExitCode {
         "apply" => run_apply(&a),
         "profile" => run_profile(&a),
         "watch" => run_watch(&a),
+        "bench" => run_bench(&a, &bench_args),
         _ => run_measure(&a, threads_from),
     };
     ExitCode::from(code)
@@ -939,6 +950,66 @@ fn run_watch(a: &Args) -> u8 {
         }
         std::thread::sleep(std::time::Duration::from_secs(every));
     }
+}
+
+/// bench A B [--rounds N] -- ARGS...: run A and B with the same ARGS, alternating (A B, B A, ...) after one warm-up
+/// each, and give a verdict only when the two spreads do not overlap. 2026-10-16: a hand-run comparison said 12
+/// threads were slower than the default, which also used 12: one run is nothing (the confirm rule).
+fn run_bench(a: &Args, rest: &[String]) -> u8 {
+    if a.paths.len() != 2 {
+        eprintln!("gorilla-size bench: give two programs, then -- and the arguments for both");
+        return 2;
+    }
+    let rounds = a.rounds.max(3);
+    let run = |exe: &Path| -> Option<f64> {
+        let t = Instant::now();
+        let ok = std::process::Command::new(exe).args(rest).stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()).status().ok()?.success();
+        ok.then(|| t.elapsed().as_secs_f64())
+    };
+    let (ea, eb) = (&a.paths[0], &a.paths[1]);
+    if run(ea).is_none() || run(eb).is_none() {
+        eprintln!("gorilla-size bench: a program failed with those arguments (warm-up)");
+        return 3;
+    }
+    let (mut ta, mut tb) = (Vec::new(), Vec::new());
+    for r in 0..rounds {
+        let order: [(&PathBuf, bool); 2] = if r % 2 == 0 { [(ea, true), (eb, false)] } else { [(eb, false), (ea, true)] };
+        for (exe, is_a) in order {
+            match run(exe) {
+                Some(s) if is_a => ta.push(s),
+                Some(s) => tb.push(s),
+                None => {
+                    eprintln!("gorilla-size bench: {} failed in round {}", exe.display(), r + 1);
+                    return 3;
+                }
+            }
+        }
+    }
+    let stats = |v: &mut Vec<f64>| {
+        v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let q = |f: f64| v[((v.len() - 1) as f64 * f).round() as usize];
+        (q(0.5), q(0.25), q(0.75))
+    };
+    let (ma, la, ha) = stats(&mut ta);
+    let (mb, lb, hb) = stats(&mut tb);
+    let verdict = if ha < lb {
+        format!("A FASTER: {:.2}x", mb / ma)
+    } else if hb < la {
+        format!("B FASTER: {:.2}x", ma / mb)
+    } else {
+        "INCONCLUSIVE: the middle halves of the runs overlap (more --rounds, or a quieter machine)".to_string()
+    };
+    if a.json {
+        print_json(&json!({"a": ea.display().to_string(), "b": eb.display().to_string(), "args": rest,
+                           "rounds": rounds, "a_seconds": ta, "b_seconds": tb, "a_median": ma, "b_median": mb,
+                           "verdict": verdict}));
+    } else {
+        println!("A {}  median {ma:.3} s  (middle half {la:.3}-{ha:.3})", ea.display());
+        println!("B {}  median {mb:.3} s  (middle half {lb:.3}-{hb:.3})", eb.display());
+        println!("{rounds} alternating rounds after a warm-up each. {verdict}");
+    }
+    0
 }
 
 fn run_profile(a: &Args) -> u8 {

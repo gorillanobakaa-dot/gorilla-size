@@ -42,6 +42,28 @@ fn json(args: &[&str]) -> Value {
     serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"))
 }
 
+/// Can this machine's account recycle at all? A fresh CI runner has never deleted anything, so its Recycle Bin
+/// folder does not exist and the tool refuses (correctly: it never asks Windows, which destroyed instead, there).
+fn bin_available() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        let t = std::env::temp_dir().join(format!("gorilla-size-binprobe-{}", std::process::id()));
+        fs::write(&t, b"probe").unwrap();
+        let (rc, out, _) = run(&["recycle", t.to_str().unwrap(), "--json"]);
+        if rc == 0 {
+            let v: Value = serde_json::from_str(&out).unwrap();
+            let (urc, _, _) = run(&["undo", v["journal"].as_str().unwrap()]);
+            assert_eq!(urc, 0, "the probe went to the bin and must come back");
+            let _ = fs::remove_file(&t);
+            return true;
+        }
+        let _ = fs::remove_file(&t);
+        assert!(out.contains("no Recycle Bin folder") || out.contains("no home folder"), "unexpected refusal: {out}");
+        eprintln!("SKIPPED (no Recycle Bin for this account on this machine): {out}");
+        false
+    })
+}
+
 fn s(p: &Path) -> &str {
     p.to_str().unwrap()
 }
@@ -166,6 +188,9 @@ fn move_on_one_drive_then_undo_puts_it_back() {
 
 #[test]
 fn recycle_really_reaches_the_bin_and_undo_restores_it() {
+    if !bin_available() {
+        return;
+    }
     let t = tmp("bin");
     let victim = t.0.join(format!("gorilla-size-test-{}.txt", std::process::id()));
     file(&victim, b"put me in the bin");
@@ -182,6 +207,9 @@ fn recycle_really_reaches_the_bin_and_undo_restores_it() {
 
 #[test]
 fn a_large_recycle_is_held_for_a_plan_and_apply_carries_it_out() {
+    if !bin_available() {
+        return;
+    }
     let t = tmp("plan");
     for i in 0..5 {
         file(&t.0.join(format!("junk/f{i}")), b"x");
@@ -265,6 +293,9 @@ fn regular_expressions_for_names_and_inside_files() {
 
 #[test]
 fn reports_and_plans_saved_with_a_byte_order_mark_are_read() {
+    if !bin_available() {
+        return;
+    }
     let t = tmp("bom");
     file(&t.0.join("tree/a"), b"12345");
     let (_, out, _) = run(&[s(&t.0.join("tree")), "--json"]);
@@ -298,6 +329,24 @@ fn a_hard_linked_file_is_one_file_when_links_are_checked() {
     let v = json(&args);
     assert_eq!(v["roots"][0]["totals"]["files"], 1, "{}", v["roots"][0]["totals"]);
     assert_eq!(v["roots"][0]["totals"]["hardlink_repeats"], 1);
+}
+
+#[test]
+fn bench_gives_a_verdict_only_when_the_runs_do_not_overlap() {
+    let t = tmp("bench");
+    for i in 0..200 {
+        file(&t.0.join(format!("d{}/f{i}", i % 20)), b"x");
+    }
+    // the same program twice: whatever the noise, it must never claim one is faster with overlapping runs
+    // bench's own --json goes BEFORE `--`; everything after it belongs to the two programs
+    let (rc, out, err) = run(&["bench", BIN, BIN, "--rounds", "5", "--json", "--", s(&t.0), "--json"]);
+    assert_eq!(rc, 0, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["a_seconds"].as_array().unwrap().len(), 5);
+    let verdict = v["verdict"].as_str().unwrap();
+    assert!(verdict.starts_with("INCONCLUSIVE") || verdict.contains("FASTER"), "{verdict}");
+    let (rc, _, err) = run(&["bench", BIN, "--", "x"]);
+    assert_eq!(rc, 2, "{err}");
 }
 
 #[test]
