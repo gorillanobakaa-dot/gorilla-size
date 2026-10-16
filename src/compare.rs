@@ -19,7 +19,10 @@ fn flatten(v: &Value, prefix: &str, out: &mut BTreeMap<String, u64>) {
 
 fn load(path: &str) -> Result<BTreeMap<String, u64>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: not a gorilla-size JSON report: {e}"))?;
+    // Windows PowerShell 5.1 writes UTF-8 with a byte-order mark (Set-Content -Encoding utf8, Out-File); JSON parsers
+    // reject it. 2026-10-16: a report saved that way was refused as "not a gorilla-size JSON report".
+    let text = text.trim_start_matches('\u{feff}');
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("{path}: not a gorilla-size JSON report: {e}"))?;
     let roots = v["roots"].as_array().ok_or(format!("{path}: no \"roots\" (make it with gorilla-size --json)"))?;
     let mut m = BTreeMap::new();
     for r in roots {

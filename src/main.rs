@@ -763,7 +763,8 @@ fn run_apply(a: &Args) -> u8 {
             return 2;
         }
     };
-    let v: Value = match serde_json::from_str(&text) {
+    // a plan reviewed and saved in Notepad or PowerShell 5.1 can start with a UTF-8 byte-order mark
+    let v: Value = match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("gorilla-size apply: not a plan: {e}");

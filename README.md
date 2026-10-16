@@ -4,158 +4,206 @@
 
 Your disk is full and you do not know why. `gorilla-size` looks at a folder and tells you, biggest first, what is
 inside it and how much room each part takes: like opening every drawer in a house at once and weighing what is in
-each one. It can also **find** things ("every file bigger than 2 GB that nobody has touched for a year") and
-**compare** two measurements ("what grew since last week?").
+each one. It can **find** things ("every file bigger than 2 GB that nobody has touched for a year"), **read** them
+("show me the last 20 lines of every log that mentions ERROR"), **compare** two measurements ("what grew since last
+week?"), and **tidy up**: copy, move or send to the Recycle Bin, every step checked and undoable.
 
-It only looks. It never deletes, moves or changes anything, and it never connects to the internet.
+Two promises: it **never deletes anything for good** (the Recycle Bin is the furthest it goes, and it checks the
+item really arrived there), and it **never connects to the internet**.
 
 ## Technical Definition (Developer Track)
 
-A single static binary (Rust, no runtime, no installer) that walks a directory tree in parallel on every core and
-reports apparent or allocated size per entry, as a sorted tree (dust/erdtree style), as a filtered list (fd style,
-with folder sizes as a filter, which fd cannot do), or as JSON for programs. Junctions, symlinks and mount points are
-listed and never followed; hard links are counted once; unreadable entries are counted and listed, never silently
-skipped. On Windows, `--mft` reads the NTFS master file table of the volume directly (administrator), the method
-WizTree uses.
+A single static binary (Rust, no runtime, no installer, 2.6 MiB on Windows) that walks a directory tree in parallel
+on every core and reports apparent or allocated size per entry as a sorted tree (dust/erdtree style), as a filtered
+list (fd style, with folder sizes as a filter, which fd cannot do) or as JSON/JSONL for programs; reads inside what
+it finds (head/tail/line ranges, literal or regex search, byte-capped); hashes (SHA-256), finds duplicates, empty
+folders and broken links; copies, moves and recycles with verification, a journal and undo; holds large operations
+for a reviewed plan. Junctions, symlinks and mount points are listed and never followed; hard links are counted once;
+what was skipped, excluded or unreadable is always reported. On Windows, `--mft` reads the NTFS master file table
+directly (administrator). A per-machine profile picks the fastest thread count for each disk.
 
-## Table of contents
+## Contents
 
 1. The 30-second version
 2. Why it exists
 3. Install
-4. Reports
-5. Find
-6. Compare
-7. The master file table (`--mft`, Windows)
-8. What it counts, and what it says it did not
-9. For programs: the JSON contract
-10. Security: doors open and closed
-11. Building from source
-12. Licence
+4. Measure
+5. Find and read
+6. Act: copy, move, recycle, undo
+7. The machine profile
+8. The master file table (`--mft`, Windows)
+9. What it counts, and what it says it did not
+10. For programs: the JSON contract
+11. Security: doors open and closed
+12. Building from source
+13. License
 
 ## 1. The 30-second version
 
 ```
-gorilla-size C:\Users\me\Documents             what takes the space here, biggest first
-gorilla-size -d 3 -f 10 D:\                     three levels deep, plus the ten largest files anywhere
-gorilla-size find --type d --min-size 5G C:\    every folder of 5 GiB or more
-gorilla-size find --ext iso,zip --older 1y .    old archives nobody has opened in a year
-gorilla-size . --json > before.json             a measurement a program (or a later compare) can read
-gorilla-size compare before.json after.json     what grew, shrank, appeared or went
+gorilla-size D:\                                   what takes the space, biggest first
+gorilla-size D:\ -d 3 -f 10 --types                three levels, the 10 largest files, bytes by extension
+gorilla-size find --type d --min-size 5G C:\       every folder of 5 GiB or more
+gorilla-size find --ext log --grep ERROR --tail 5 . logs that mention ERROR, with their last 5 lines
+gorilla-size find --ext iso,zip --older 1y . --recycle    old archives to the Recycle Bin (verified, undoable)
+gorilla-size dupes D:\Photos                       the same bytes in more than one place
+gorilla-size . -d 3 --json > before.json           a measurement to compare later
+gorilla-size compare before.json after.json        what grew, shrank, appeared or went
+gorilla-size undo <journal>                        put back what an action did
 ```
 
 ## 2. Why it exists
 
-On 2026-10-16 a model cleaning up four Firefox source trees (about 480,000 files each) measured them with `du`. It
-ran for 25 minutes on the first folder and was stopped. A hand-typed `robocopy` line then got the numbers, but a
-hand-typed line is not a tool: nobody can test it, and the next session types it again. `gorilla-size` is the tool.
+On 2026-10-16 a model cleaning up Firefox source trees (about 480,000 files each) measured them with `du`. It ran
+for 25 minutes on the first folder and was stopped. A hand-typed `robocopy` line got the numbers. A hand-typed
+"send to the Recycle Bin" call then destroyed one folder for good instead of recycling it, and the check said
+"recycled" because it only looked at whether the folder had left its place. `gorilla-size` is the tool that should
+have been used: same numbers, in under a second, and an action that is checked where it matters.
 
-Measured the same day on a Windows 11 laptop (12 threads, NTFS, SSD), against robocopy's totals:
+Measured on a Windows 11 laptop (Intel i7-1255U: 2 performance + 8 efficiency cores, NVMe SSD), warm file system
+cache, medians of alternating runs:
 
-| Tree | gorilla-size | robocopy |
+| Tree | gorilla-size | du (Git for Windows) |
 |---|---|---|
-| Firefox 157 working tree, 481,410 files | 4.47 GiB in 11.5 s (first, cold) | 4.5 GB |
-| Firefox 155 tree, 538,473 files | 9.02 GiB in 1.8 s | 9.0 GB |
-| Firefox 158 pristine tree, 482,864 files | 4.42 GiB in 0.43 s (warm cache) | – |
+| Firefox 155 tree, 473,152 files, 4.35 GiB | 0.6 s | stopped after 25 minutes |
+| a work folder, 956,014 files, 9.0 GiB | 1.2 s | – |
+| a Documents folder, 3.2 million files, 216 GiB | 4.3 to 6.0 s (depends on load) | – |
 
-Times depend on the disk and on whether the file system cache is warm; the byte counts do not.
+The byte counts match robocopy's and the master file table's to the byte on the first two trees.
 
 ## 3. Install
 
-There is nothing to install. Copy the one file for your system anywhere and run it:
+Nothing to install. Copy the one file for your system anywhere and run it:
 
-- Windows: `gorilla-size.exe` (the C runtime is inside it: no Visual C++ package needed)
+- Windows: `gorilla-size.exe` (the C runtime is built in; no Visual C++ package needed)
 - Linux: `gorilla-size` built for `x86_64-unknown-linux-musl` (static: any distribution)
 
-To make it a command everywhere, put the file in a folder on your PATH (Windows: for example
-`%USERPROFILE%\.local\bin`; Linux: `~/.local/bin`).
+To run it from anywhere, put it in a folder on your PATH (Windows: for example `%USERPROFILE%\.local\bin`; Linux:
+`~/.local/bin`).
 
-## 4. Reports
+## 4. Measure
 
 ```
-gorilla-size [OPTIONS] [PATH ...]
+gorilla-size [OPTIONS] [PATH ...]      gorilla-size types [PATH ...]      gorilla-size free
+gorilla-size newest|oldest [PATH ...]  gorilla-size watch PATH --every 60 gorilla-size compare OLD.json NEW.json
 ```
 
 | Option | Meaning |
 |---|---|
-| `-d, --depth N` | levels shown (default 1) |
-| `-n, --number N` | entries per level (default 20); the rest are summed into one "... N more" line |
-| `-f, --files N` | also the N largest files anywhere under PATH |
-| `--disk` | size on disk (allocated: after compression, sparse files and cluster rounding) instead of apparent size. Linux: free. Windows: one extra call per file |
-| `--links` | Windows: count a hard-linked file once (opens each file; slower). Linux and macOS always do |
-| `--cross-filesystems` | Linux/macOS: walk into other mounted file systems too (default: stay on the one PATH is on) |
-| `--list-links`, `--list-errors` | list what was not followed / not readable |
-| `-j, --threads N` | worker threads (default: every core) |
-| `--json` | machine-readable (section 9) |
-| `--ascii` | plain characters; automatic when the output is piped |
-| `--strict` | exit 3 when anything could not be read |
+| `-d N`, `-n N` | levels shown (1); entries per level (20, the rest summed in one line) |
+| `-f N` | also the N largest files anywhere |
+| `--types` | bytes and files by extension |
+| `--disk` | size on disk (after compression, sparse files, clusters) instead of apparent size |
+| `--links` | Windows: count a hard-linked file once (opens every file: much slower). Linux/macOS always do |
+| `--gitignore`, `--exclude PAT` | skip what .gitignore files ignore; skip a pattern (gitignore syntax, repeatable) |
+| `--no-hidden` | skip hidden entries (the count of what was skipped is reported) |
+| `--reverse`, `--flat`, `--long` | smallest first; one flat list at `--depth`; attributes/permissions and dates |
+| `--progress` | live count on stderr for long scans |
+| `--cross-filesystems` | Linux/macOS: enter other mounted file systems too (default: stay on one) |
+| `--list-links`, `--list-errors`, `--strict` | what was not followed / not readable; exit 3 if anything was unreadable |
+| `-j N` | threads (default: the calibrated count for that disk, otherwise every core) |
+| `--json`, `--ascii` | machine-readable; plain characters (automatic when piped) |
 
-## 5. Find
-
-```
-gorilla-size find [--name GLOB] [--ext a,b] [--min-size S] [--max-size S] [--newer AGE] [--older AGE]
-                  [--type f|d|l] [--sort size|name|age] [-n N] [PATH ...]
-```
-
-Sizes: `500M`, `2G`, `1.5T` (binary: 1 G = 1024³ bytes, as Explorer and du mean it). Ages: `90s`, `30m`, `12h`,
-`7d`, `2w`, `1y`. A folder's size is everything under it, so `--type d --min-size 10G` finds the folders that hold
-the space. Names ignore case on Windows and macOS (`-s` to match case).
-
-## 6. Compare
+## 5. Find and read
 
 ```
-gorilla-size -d 3 --json D:\Work > monday.json
-gorilla-size -d 3 --json D:\Work > friday.json
-gorilla-size compare monday.json friday.json
+gorilla-size find [FILTERS] [OUTPUT] [READ] [PATH ...]
 ```
 
-Every entry both reports list, sorted by how much it changed: `grew`, `shrank`, `new`, `gone`.
+- **Filters:** `--name GLOB`, `--regex RE`, `--ext a,b`, `--min-size 2G`, `--max-size 10M`, `--newer 7d`,
+  `--older 1y`, `--type f|d|l`, `--sort size|name|age`, `-n N`, `-i` / `-s` (case). A folder's size is everything
+  under it, so `--type d --min-size 10G` finds the folders holding the space.
+- **Output for the next step:** `--paths` (one per line), `-0` (NUL-separated), `--jsonl` (one JSON object per line),
+  `--format '{path}\t{size}\t{date}'` (fields: path, name, bytes, size, kind, mtime, date).
+- **Read in the same call:** `--head N`, `--tail N` (reads only the end, even of a 50 GiB log), `--lines A:B`,
+  `--grep TEXT`, `--grep-re RE`, capped by `--max-bytes` (16 KiB per file) and `--max-hits` (20 per file). Binary
+  files are recognized and never dumped.
+- **Also:** `hash PATH ...` (SHA-256), `dupes PATH ...` (size, then the first 64 KiB, then the full hash: unique
+  sizes are never read), `empty PATH`, `reparse PATH` (every link, its target, broken or not).
 
-## 7. The master file table (`--mft`, Windows)
-
-NTFS keeps a table with one record per file: its name, its parent folder and its size. Reading that table from start
-to end, in large sequential blocks, is far faster than asking for every folder one by one. It needs administrator
-rights because the volume is opened raw. It opens it **read-only**: nothing is written, locked or dismounted.
+## 6. Act: copy, move, recycle, undo
 
 ```
-gorilla-size --mft C:\           (from an administrator prompt)
+gorilla-size copy SRC ... --to DIR     gorilla-size move SRC ... --to DIR     gorilla-size recycle PATH ...
+find ... --copy-to DIR | --move-to DIR | --recycle                            gorilla-size undo JOURNAL
 ```
 
-Said plainly: alternate data streams are not counted (Explorer does not count them either), and only NTFS has the
-table; on any other file system use the normal mode.
+- **copy:** every byte of every copied file is compared with its source. An existing target is refused unless
+  `--overwrite`, which first moves the old one aside (`name.gorilla-bak-<time>`), never destroys it.
+- **move:** on the same drive a rename, checked; across drives a verified copy and then a verified recycle of the
+  source.
+- **recycle:** to the Windows Recycle Bin or the freedesktop trash (Linux). On Windows it is **refused before
+  anything is touched** when Windows would destroy instead of recycle: a drive without a Recycle Bin (USB sticks,
+  network shares), a drive set to delete immediately, an item bigger than the bin, a bin that would have to throw
+  away its oldest items to make room, or a path longer than 259 characters. After the action, the item must be found
+  in the **bin's own records**; if it left its place and is not there, the tool stops and says so in capitals.
+- **undo:** every action writes a journal (`%LOCALAPPDATA%\gorilla\journal`, `~/.local/state/gorilla/journal`);
+  `undo` reverses it: copies are recycled, moves go back, recycled items are restored.
+- **Large operations:** a move or recycle above 1,000 files or 10 GiB (`--plan-files`, `--plan-bytes`) is **held**:
+  the tool writes a plan file and stops (exit 4). Review it, then `gorilla-size apply PLAN`, which skips anything that
+  changed since the plan was written. `--plan` writes one on purpose. Copies are never held.
+- **There is no permanent delete.** Emptying the Recycle Bin stays a person's decision.
 
-## 8. What it counts, and what it says it did not
+## 7. The machine profile
 
-- **Junctions, symlinks, mount points:** listed, never followed, so nothing is counted twice. The report says how many.
+`gorilla-size profile` shows the processor (performance and efficiency cores, instruction sets), the memory and the
+disks it knows. `gorilla-size profile --recalibrate FOLDER` walks FOLDER with 1, 2, 4 ... every thread, alternating,
+several rounds, and keeps the fastest count for that disk in `%LOCALAPPDATA%\gorilla\machine.json`
+(`~/.local/state/gorilla/machine.json`). Every later run on that disk uses it. A different CPU makes it re-measure.
+
+Measured on the laptop above: 1 thread 7.6 s, 4 threads 2.6 s, 8 to 12 threads 1.4 s (equal within noise). On a fast
+SSD every core is already best; the profile earns its keep on hard disks, USB sticks and older machines, where too
+many threads make the disk slower. The calibration runs with a warm cache: it measures day-to-day use, not the first
+scan after a reboot.
+
+## 8. The master file table (`--mft`, Windows)
+
+NTFS keeps a table with one record per file: its name, its parent folder and its size. `--mft` opens the volume
+**read-only** (nothing is written, locked or dismounted; administrator rights are needed to open it raw) and reads
+the whole table in large sequential blocks.
+
+Measured: identical bytes and file counts to the normal walk on a 473,152-file tree and on a 956,014-file tree. On a
+3.2-million-file folder that was being written to during the run, the two differed by 0.09 % of the files; this is
+under investigation. The table is read whole every time (about 15 s on that laptop's drive), so `--mft` is not the
+fastest way to measure one folder with a warm cache (the walk is). It wins on **whole drives**, on a **cold** cache,
+and when hard links must be counted once: the walk with `--links` took 192 s on the Documents folder, `--mft` 16 s.
+Alternate data streams are not counted (Explorer does not count them either).
+
+## 9. What it counts, and what it says it did not
+
+- **Junctions, symlinks, mount points:** listed, never followed, so nothing is counted twice; the report says how many.
 - **Hard links:** one file with several names is counted once (Linux/macOS always; Windows with `--links` or `--mft`).
-  When it was not checked, the report says so instead of guessing.
+  When it was not checked, the report says so.
+- **Excluded and hidden entries:** counted and reported, never silently left out.
 - **Unreadable entries:** counted and listed (`--list-errors`); `--strict` turns them into exit code 3.
-- **Apparent vs on disk:** the default is what the files hold. `--disk` is what they occupy.
-- **Units:** printed as KiB, MiB, GiB, TiB (1024-based), so a number never claims more than it is.
+- **Units:** KiB, MiB, GiB, TiB (1024-based), so a number never claims more than it is.
 
-## 9. For programs: the JSON contract
+## 10. For programs: the JSON contract
 
-`--json` prints one object: `tool`, `version`, `mode` (`report`/`find`), `engine` (`walk`/`mft`), `size`
-(`apparent`/`disk`), `hardlinks_counted_once`, `threads`, `seconds`, and `roots`: one entry per PATH with
-`path`, `seconds`, `totals` (`bytes`, `disk_bytes`, `files`, `dirs`, `links_not_followed`, `unreadable`,
-`other_filesystems`, `hardlink_repeats`, `hardlink_bytes_not_counted_twice`), `tree` (name, kind, bytes, disk_bytes,
-files, dirs, mtime, children — to `--depth`), `top_files`, `links`, `errors`, `other_filesystems`, and for `find`,
-`found`. Exit codes: 0 done, 2 bad usage or missing path, 3 `--strict` with unreadable entries.
+`--json` prints one object: `tool`, `version`, `mode`, `engine` (`walk`/`mft`), `size` (`apparent`/`disk`),
+`hardlinks_counted_once`, `threads`, `threads_from` (`asked`/`profile`/`every core`), `seconds`, and `roots`: one
+entry per PATH with `totals` (`bytes`, `disk_bytes`, `files`, `dirs`, `links_not_followed`, `unreadable`,
+`other_filesystems`, `excluded`, `hidden_skipped`, `hardlink_repeats`, `hardlink_bytes_not_counted_twice`), `tree`,
+`top_files`, `types`, `links`, `errors`, `other_filesystems`, and for `find`, `found`. Actions print `journal`, `ok`,
+`failed` and `actions`; a held operation prints `held`, `why` and `plan`.
 
-## 10. Security: doors open and closed
+Exit codes: 0 done, 2 bad usage or missing path, 3 something failed (or `--strict` with unreadable entries),
+4 held for a plan.
 
-- **Network:** none. There is no update check, no telemetry, no download, no "phone home". The program has no
-  network code.
-- **Writes:** none. It reads directory listings and file metadata; it never opens a file's contents (the `--mft`
-  mode reads the volume's table, read-only).
-- **Dependencies:** 11 crates (rayon and its crossbeam parts; serde_json and its helpers), all vendored in `vendor/`
-  with their checksums, built with `--offline --locked`. After the one download that made `vendor/`, nobody can
-  change what goes into the binary without it showing in this repository's history. Windows calls are declared by
-  hand against `kernel32` and `advapi32`; no Windows crate, no prebuilt import library.
+## 11. Security: doors open and closed
+
+- **Network:** none. No update check, no telemetry, no download. The program contains no network code.
+- **What it changes:** only what you ask with `copy`, `move`, `recycle`, `undo` and `apply`; everything else reads.
+  It never deletes for good.
+- **Dependencies:** 15 crates, vendored in `vendor/` with their checksums (`DEPENDENCIES.md` says why each one is
+  there), built with `--offline --locked`. After the one download that made `vendor/`, nobody can change what goes
+  into the binary without it showing in this repository's history. SHA-256, gitignore matching and the Recycle Bin
+  code are written here, not imported. Windows calls are declared by hand against `kernel32`, `advapi32` and
+  `shell32`; no Windows crate, no prebuilt import library.
 - **Who can act through it:** whoever can replace the binary on your disk, as with any program. Check the SHA-256 on
   the release page against the file you have.
 
-## 11. Building from source
+## 12. Building from source
 
 ```
 cargo build --release --offline --locked
@@ -163,9 +211,10 @@ cargo test  --release --offline --locked
 ```
 
 Linux, one static file: `cargo build --release --offline --locked --target x86_64-unknown-linux-musl`. The `--mft`
-agreement test needs an elevated prompt: `cargo test --release --offline --locked -- --ignored`.
+agreement test needs an elevated prompt: `cargo test --release --offline --locked -- --ignored`, or
+`scripts/mft-check.ps1`.
 
-## 12. Licence
+## 13. License
 
 AGPL-3.0-or-later. Use it, change it, share it; a version you ship or run as a service stays open under the same
-licence.
+license.

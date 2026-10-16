@@ -239,7 +239,8 @@ pub fn undo(journal: &Path) -> Vec<Done> {
         Err(e) => return vec![done("undo", journal, Path::new(""), false, e.to_string())],
     };
     let mut out = Vec::new();
-    let entries: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let entries: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l.trim_start_matches('\u{feff}')).ok())
+        .collect();
     for e in entries.iter().rev() {
         if e["ok"] == false {
             continue;
@@ -404,9 +405,17 @@ mod bin {
         }
         let (_, bytes) = super::tally(p);
         if let Some(mb) = reg_dword(&key, "MaxCapacity") {
-            if bytes > mb as u64 * 1024 * 1024 {
+            let cap = mb as u64 * 1024 * 1024;
+            if bytes > cap {
                 return Err(format!("{} bytes is more than the Recycle Bin of {r} holds ({mb} MB): Windows would \
                                     delete it permanently", bytes));
+            }
+            // 2026-10-16: a full bin makes Windows destroy its OLDEST items, silently, to make room for new ones
+            let used = bin_dir(p).map(|d| super::tally(&d).1).unwrap_or(0);
+            if used + bytes > cap {
+                return Err(format!("the Recycle Bin of {r} already holds {} of {} MB; adding {} would make Windows \
+                                    permanently delete its oldest items to make room. Empty the bin first, or move \
+                                    a smaller batch", crate::units::human(used), mb, crate::units::human(bytes)));
             }
         }
         let lp = longest_path(p);

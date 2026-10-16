@@ -1,0 +1,61 @@
+# A tag v* publishes a release, only after the tests pass on Windows and Linux for that exact commit, and only when
+# the tag names the version in Cargo.toml. Assets: the Windows .exe, the static Linux binary and SHA256SUMS.
+# The page is releases/<tag>.md (both tracks); a tag without its page is not published.
+name: release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  test:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --release --offline --locked
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --offline --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: target/release/gorilla-size.exe
+  linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --release --offline --locked --target x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: target/x86_64-unknown-linux-musl/release/gorilla-size
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: the tag names the version in Cargo.toml, and its page exists
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $v: not published"; exit 1; }
+          test -s "releases/$GITHUB_REF_NAME.md" || { echo "releases/$GITHUB_REF_NAME.md missing: not published"; exit 1; }
+      - uses: actions/download-artifact@v4
+      - name: assets and checksums
+        run: |
+          mkdir out
+          cp windows/gorilla-size.exe out/gorilla-size-windows-x86_64.exe
+          cp linux/gorilla-size out/gorilla-size-linux-x86_64
+          chmod +x out/gorilla-size-linux-x86_64
+          cd out && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/* --title "gorilla-size $GITHUB_REF_NAME" --notes-file "releases/$GITHUB_REF_NAME.md"

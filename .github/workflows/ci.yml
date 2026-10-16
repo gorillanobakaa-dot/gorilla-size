@@ -1,0 +1,23 @@
+# Every push and pull request: the whole test suite on Windows and on Linux, built only from vendor/ (--offline
+# --locked: no crate is downloaded on the runner), plus the static Linux binary.
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --release --offline --locked
+  linux-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --release --offline --locked --target x86_64-unknown-linux-musl
+      - run: ./target/x86_64-unknown-linux-musl/release/gorilla-size --version

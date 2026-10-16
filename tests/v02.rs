@@ -264,6 +264,43 @@ fn regular_expressions_for_names_and_inside_files() {
 }
 
 #[test]
+fn reports_and_plans_saved_with_a_byte_order_mark_are_read() {
+    let t = tmp("bom");
+    file(&t.0.join("tree/a"), b"12345");
+    let (_, out, _) = run(&[s(&t.0.join("tree")), "--json"]);
+    let mut bom = vec![0xEF, 0xBB, 0xBF];
+    bom.extend_from_slice(out.as_bytes());
+    fs::write(t.0.join("old.json"), &bom).unwrap();
+    fs::write(t.0.join("new.json"), &bom).unwrap();
+    let (rc, _, err) = run(&["compare", s(&t.0.join("old.json")), s(&t.0.join("new.json"))]);
+    assert_eq!(rc, 0, "{err}");
+    let held = json(&["recycle", s(&t.0.join("tree")), "--plan"]);
+    let plan = held["plan"].as_str().unwrap().to_string();
+    let mut p = vec![0xEF, 0xBB, 0xBF];
+    p.extend(fs::read(&plan).unwrap());
+    fs::write(&plan, p).unwrap();
+    let applied = json(&["apply", &plan]);
+    assert_eq!(applied["failed"], 0, "{applied}");
+    let u = json(&["undo", applied["journal"].as_str().unwrap()]);
+    assert_eq!(u["failed"], 0, "{u}");
+}
+
+#[test]
+fn a_hard_linked_file_is_one_file_when_links_are_checked() {
+    let t = tmp("hl");
+    file(&t.0.join("a/blob"), &vec![1u8; 1000]);
+    fs::create_dir_all(t.0.join("b")).unwrap();
+    fs::hard_link(t.0.join("a/blob"), t.0.join("b/blob")).unwrap();
+    let mut args = vec![s(&t.0)];
+    if cfg!(windows) {
+        args.push("--links");
+    }
+    let v = json(&args);
+    assert_eq!(v["roots"][0]["totals"]["files"], 1, "{}", v["roots"][0]["totals"]);
+    assert_eq!(v["roots"][0]["totals"]["hardlink_repeats"], 1);
+}
+
+#[test]
 fn newest_and_oldest() {
     let t = tmp("age");
     file(&t.0.join("old"), b"1");

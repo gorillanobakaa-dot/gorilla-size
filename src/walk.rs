@@ -383,9 +383,11 @@ fn walk(dir: &Path, rel: String, name: String, mtime: Option<u64>, depth: usize,
             }
             EKind::File => {
                 let (bytes, disk) = if sh.repeat(&path, &e) {
+                    // another name of a file already counted: not a second file. 2026-10-16: the walk counted 2,857
+                    // such names as files and disagreed with the master file table (one record per file) by 2,855.
                     sh.hardlink_repeats.fetch_add(1, Relaxed);
                     sh.hardlink_bytes.fetch_add(e.len, Relaxed);
-                    (0, 0)
+                    continue;
                 } else {
                     let disk = match e.alloc {
                         Some(a) => a,
