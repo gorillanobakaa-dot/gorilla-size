@@ -135,17 +135,22 @@ pub fn copy(src: &Path, to: &Path, overwrite: bool, j: &mut Journal) -> Done {
         let _ = j.write(&json!({"op": "aside", "from": dst.display().to_string(), "to": bak.display().to_string()}));
     }
     let mut files = Vec::new();
+    // `dst` did not exist before this point (refused above, or moved aside), so anything there now was made here:
+    // a failure is journalled with `partial` so that undo can recycle the half-made tree.
     if let Err(e) = copy_tree(src, &dst, &mut files) {
         let _ = j.write(&json!({"op": "copy", "from": src.display().to_string(), "to": dst.display().to_string(),
-                                "ok": false, "why": e}));
+                                "ok": false, "partial": fs::symlink_metadata(&dst).is_ok(), "why": e}));
         return done("copy", src, &dst, false, e);
     }
     for (a, b) in &files {
-        match same_bytes(a, b) {
-            Ok(true) => {}
-            Ok(false) => return done("copy", a, b, false, "VERIFY FAILED: the copy differs from its source"),
-            Err(e) => return done("copy", a, b, false, format!("VERIFY FAILED: {e}")),
-        }
+        let why = match same_bytes(a, b) {
+            Ok(true) => continue,
+            Ok(false) => "VERIFY FAILED: the copy differs from its source".to_string(),
+            Err(e) => format!("VERIFY FAILED: {e}"),
+        };
+        let _ = j.write(&json!({"op": "copy", "from": src.display().to_string(), "to": dst.display().to_string(),
+                                "ok": false, "partial": true, "why": format!("{}: {why}", b.display())}));
+        return done("copy", a, b, false, why);
     }
     let _ = j.write(&json!({"op": "copy", "from": src.display().to_string(), "to": dst.display().to_string(),
                             "ok": true, "files": files.len()}));
@@ -235,8 +240,65 @@ pub fn recycle(p: &Path, j: &mut Journal) -> Done {
 
 // ---------------------------------------------------------------------------------------------------------- undo
 
-/// Reverse a journal, newest entry first. Copies are recycled (never deleted); moves go back; recycled items are
-/// restored from the bin; an "aside" (an old target kept by --overwrite) is put back.
+/// Rename `a` to `b` only while nothing is at `b`. `std::fs::rename` REPLACES an existing file on Windows
+/// (MoveFileExW with MOVEFILE_REPLACE_EXISTING) and on Unix (rename(2)), so an undo built on it silently destroyed a
+/// file created at the original path after the move (found 2026-10-18).
+/// Windows: MoveFileExW with no flags fails when the target exists, so the check and the rename are one call.
+/// Unix: std has no no-replace rename (renameat2 is Linux-only and absent from older musl), so the target is checked
+/// first; a file created in the microseconds between the check and the rename is the remaining, stated, window.
+fn rename_no_replace(a: &Path, b: &Path) -> Result<(), String> {
+    if fs::symlink_metadata(b).is_ok() {
+        return Err(format!("REFUSED, nothing moved: {} exists now (move it away, then undo again)", b.display()));
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+        }
+        let (wa, wb) = (crate::os::win::wide(a), crate::os::win::wide(b));
+        // SAFETY: both buffers are NUL-terminated UTF-16 that outlive the call.
+        if unsafe { MoveFileExW(wa.as_ptr(), wb.as_ptr(), 0) } == 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(if fs::symlink_metadata(b).is_ok() {
+                format!("REFUSED, nothing moved: {} appeared during the undo ({e})", b.display())
+            } else {
+                e.to_string()
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(a, b).map_err(|e| e.to_string())
+    }
+}
+
+/// Why the copy at `dst` may no longer be the copy this tool made, or None. A file is compared byte for byte with its
+/// source; a folder by file count and bytes (a same-size edit inside a folder is not seen: stated, not hidden). When
+/// the source is gone nothing can be compared; the undo goes ahead because recycling is itself reversible.
+fn changed_since_copy(src: &Path, dst: &Path) -> Option<String> {
+    let sm = fs::symlink_metadata(src).ok()?;
+    if sm.is_file() {
+        return match same_bytes(src, dst) {
+            Ok(true) => None,
+            Ok(false) => Some(format!("{} differs from its source now (edited after the copy?)", dst.display())),
+            Err(e) => Some(format!("{} could not be compared with its source: {e}", dst.display())),
+        };
+    }
+    let (sn, sb) = tally(src);
+    let (dn, db) = tally(dst);
+    if (sn, sb) != (dn, db) {
+        return Some(format!("{} holds {dn} file(s)/{db} bytes, its source {sn}/{sb} (changed after the copy?)",
+                            dst.display()));
+    }
+    None
+}
+
+/// Reverse a journal, newest entry first. A copy is recycled (never deleted) unless it changed since; a move goes
+/// back only to a free original path; a recycled item is restored from the bin (refused onto an occupied path); an
+/// "aside" (an old target kept by --overwrite) is put back only to a free path. A copy that failed half way
+/// (journalled `partial`) is recycled too, so a failed copy never leaves an unjournalled half tree behind.
 pub fn undo(journal: &Path) -> Vec<Done> {
     let text = match fs::read_to_string(journal) {
         Ok(t) => t,
@@ -250,19 +312,29 @@ pub fn undo(journal: &Path) -> Vec<Done> {
     let entries: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l.trim_start_matches('\u{feff}')).ok())
         .collect();
     for e in entries.iter().rev() {
-        if e["ok"] == false {
-            continue;
-        }
         let from = PathBuf::from(e["from"].as_str().unwrap_or(""));
         let to = PathBuf::from(e["to"].as_str().unwrap_or(""));
-        let d = match e["op"].as_str() {
-            Some("copy") => {
+        if e["ok"] == false {
+            // A failed copy that left part of a tree behind is the one failure undo has something to reverse.
+            if e["op"] == "copy" && e["partial"] == true && fs::symlink_metadata(&to).is_ok() {
                 let r = recycle(&to, &mut j);
-                done("undo copy", &to, Path::new(&r.to), r.ok, r.why)
+                let d = done("undo partial copy", &to, Path::new(&r.to), r.ok, r.why);
+                let _ = j.write(&json!({"op": d.op, "from": d.from, "to": d.to, "ok": d.ok, "why": d.why}));
+                out.push(d);
             }
-            Some("move") if e["method"] == "rename" => match fs::rename(&to, &from) {
+            continue;
+        }
+        let d = match e["op"].as_str() {
+            Some("copy") => match changed_since_copy(&from, &to) {
+                Some(why) => done("undo copy", &to, Path::new(""), false, format!("REFUSED, nothing recycled: {why}")),
+                None => {
+                    let r = recycle(&to, &mut j);
+                    done("undo copy", &to, Path::new(&r.to), r.ok, r.why)
+                }
+            },
+            Some("move") if e["method"] == "rename" => match rename_no_replace(&to, &from) {
                 Ok(()) => done("undo move", &to, &from, from.exists() && !to.exists(), "renamed back"),
-                Err(err) => done("undo move", &to, &from, false, err.to_string()),
+                Err(err) => done("undo move", &to, &from, false, err),
             },
             Some("move") => done("undo move", &to, &from, true,
                                  "across volumes: undone by the copy and recycle entries that follow"),
@@ -273,9 +345,9 @@ pub fn undo(journal: &Path) -> Vec<Done> {
                     Err(err) => done("undo recycle", &item, &from, false, err),
                 }
             }
-            Some("aside") => match fs::rename(&to, &from) {
+            Some("aside") => match rename_no_replace(&to, &from) {
                 Ok(()) => done("undo aside", &to, &from, true, "old target put back"),
-                Err(err) => done("undo aside", &to, &from, false, err.to_string()),
+                Err(err) => done("undo aside", &to, &from, false, err),
             },
             _ => continue,
         };

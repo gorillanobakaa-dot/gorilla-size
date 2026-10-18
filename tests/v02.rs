@@ -186,6 +186,50 @@ fn move_on_one_drive_then_undo_puts_it_back() {
     assert!(t.0.join("from/thing/f.txt").exists() && !t.0.join("to/thing").exists());
 }
 
+/// An undo that ends in a refusal exits 3; read its JSON without the 0/4 assertion of `json`.
+fn json_any(args: &[&str]) -> (i32, Value) {
+    let mut a = args.to_vec();
+    a.push("--json");
+    let (rc, out, err) = run(&a);
+    (rc, serde_json::from_str(&out).unwrap_or_else(|e| panic!("rc {rc} {e}: {err}{out}")))
+}
+
+#[test]
+fn undo_never_overwrites_what_was_created_at_the_original_path_since() {
+    // 2026-10-18: undo renamed back with std::fs::rename, which REPLACES an existing file on Windows and Unix.
+    let t = tmp("undoclash");
+    file(&t.0.join("from/report.txt"), b"moved away");
+    fs::create_dir_all(t.0.join("to")).unwrap();
+    let v = json(&["move", s(&t.0.join("from/report.txt")), "--to", s(&t.0.join("to"))]);
+    assert_eq!(v["failed"], 0, "{v}");
+    file(&t.0.join("from/report.txt"), b"written after the move");
+    let (rc, u) = json_any(&["undo", v["journal"].as_str().unwrap()]);
+    assert_ne!(rc, 0, "a refused undo must not exit 0: {u}");
+    assert_eq!(u["failed"], 1, "{u}");
+    assert!(u.to_string().contains("REFUSED"), "{u}");
+    assert_eq!(fs::read(t.0.join("from/report.txt")).unwrap(), b"written after the move", "new file destroyed");
+    assert_eq!(fs::read(t.0.join("to/report.txt")).unwrap(), b"moved away", "moved file lost");
+    // Once the new file is moved away, the same journal undoes cleanly.
+    fs::rename(t.0.join("from/report.txt"), t.0.join("new.txt")).unwrap();
+    let u = json(&["undo", v["journal"].as_str().unwrap()]);
+    assert_eq!(u["failed"], 0, "{u}");
+    assert_eq!(fs::read(t.0.join("from/report.txt")).unwrap(), b"moved away");
+}
+
+#[test]
+fn undo_of_a_copy_that_was_edited_since_is_refused_and_recycles_nothing() {
+    let t = tmp("undoedit");
+    file(&t.0.join("src/notes.txt"), b"original");
+    fs::create_dir_all(t.0.join("dst")).unwrap();
+    let v = json(&["copy", s(&t.0.join("src/notes.txt")), "--to", s(&t.0.join("dst"))]);
+    assert_eq!(v["failed"], 0, "{v}");
+    file(&t.0.join("dst/notes.txt"), b"edited by the owner after the copy");
+    let (rc, u) = json_any(&["undo", v["journal"].as_str().unwrap()]);
+    assert_ne!(rc, 0, "{u}");
+    assert!(u.to_string().contains("REFUSED, nothing recycled"), "{u}");
+    assert_eq!(fs::read(t.0.join("dst/notes.txt")).unwrap(), b"edited by the owner after the copy");
+}
+
 #[test]
 fn recycle_really_reaches_the_bin_and_undo_restores_it() {
     if !bin_available() {
