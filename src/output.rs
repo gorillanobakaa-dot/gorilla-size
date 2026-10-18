@@ -37,9 +37,11 @@ fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{} {}", count(n), if n == 1 { one } else { many })
 }
 
-fn long_cols(n: &Node, st: &Style) -> String {
+/// --long: attributes (Windows) or permissions (Unix), the date, and the owner of the entry at `path`. The owner
+/// is asked only for the rows shown (one call each, names cached per account), never during the walk.
+fn long_cols(n: &Node, path: &std::path::Path, st: &Style) -> String {
     if st.long {
-        format!("{} {}  ", crate::fastdir::attr_letters(n.attrs), date(n.mtime))
+        format!("{} {}  {:<24}  ", crate::fastdir::attr_letters(n.attrs), date(n.mtime), crate::os::owner(path))
     } else {
         String::new()
     }
@@ -52,14 +54,16 @@ pub fn text(rep: &Report, st: &Style, out: &mut String) {
     out.push_str(&format!("{:>10} {:>6}  {}  {}{}   {}, {}\n", human(size(root)), "100%",
                           bar(1.0, st.width, st.ascii), root.name, kind_mark(root),
                           plural(root.files, "file", "files"), plural(root.dirs, "folder", "folders")));
+    // the root node's name is the measured path; a child's path is its parent's path joined with its name
+    let root_path = std::path::PathBuf::from(&root.name);
     if st.flat {
         let mut rows = Vec::new();
         flat(root, "", 1, st, &mut rows);
         rows.sort_by(|a, b| if st.reverse { a.0.cmp(&b.0) } else { b.0.cmp(&a.0) }.then_with(|| a.1.cmp(&b.1)));
         let shown = rows.len().min(st.per_level);
-        for (b, p, n) in &rows[..shown] {
+        for (b, p, n, rel) in &rows[..shown] {
             out.push_str(&format!("{:>10} {:>5.1}%  {}  {}{p}\n", human(*b), *b as f64 / total * 100.0,
-                                  bar(*b as f64 / total, st.width, st.ascii), long_cols(n, st)));
+                                  bar(*b as f64 / total, st.width, st.ascii), long_cols(n, &root_path.join(rel), st)));
         }
         if rows.len() > shown {
             let b: u64 = rows[shown..].iter().map(|r| r.0).sum();
@@ -68,21 +72,24 @@ pub fn text(rep: &Report, st: &Style, out: &mut String) {
         }
         return;
     }
-    tree(root, "", 1, st, total, out);
+    tree(root, &root_path, "", 1, st, total, out);
 }
 
-fn flat<'a>(n: &'a Node, prefix: &str, level: usize, st: &Style, rows: &mut Vec<(u64, String, &'a Node)>) {
+/// (size, shown label, node, path relative to the root)
+type FlatRow<'a> = (u64, String, &'a Node, String);
+
+fn flat<'a>(n: &'a Node, prefix: &str, level: usize, st: &Style, rows: &mut Vec<FlatRow<'a>>) {
     for c in &n.children {
         let p = if prefix.is_empty() { c.name.clone() } else { format!("{prefix}/{}", c.name) };
         if level == st.depth || c.children.is_empty() {
-            rows.push((if st.disk { c.disk } else { c.bytes }, format!("{p}{}", kind_mark(c)), c));
+            rows.push((if st.disk { c.disk } else { c.bytes }, format!("{p}{}", kind_mark(c)), c, p.clone()));
         } else {
             flat(c, &p, level + 1, st, rows);
         }
     }
 }
 
-fn tree(n: &Node, prefix: &str, level: usize, st: &Style, total: f64, out: &mut String) {
+fn tree(n: &Node, path: &std::path::Path, prefix: &str, level: usize, st: &Style, total: f64, out: &mut String) {
     if level > st.depth || n.children.is_empty() {
         return;
     }
@@ -98,12 +105,13 @@ fn tree(n: &Node, prefix: &str, level: usize, st: &Style, total: f64, out: &mut 
         let last = i + 1 == shown && rest.is_empty();
         let frac = size(c) as f64 / total;
         let extra = if c.kind == Kind::Dir { format!("   {}", plural(c.files, "file", "files")) } else { String::new() };
+        let cpath = path.join(&c.name);
         out.push_str(&format!("{:>10} {:>5.1}%  {}  {}{}{}{}{}{}\n", human(size(c)), frac * 100.0,
-                              bar(frac, st.width, st.ascii), long_cols(c, st), prefix, if last { ell } else { tee },
+                              bar(frac, st.width, st.ascii), long_cols(c, &cpath, st), prefix, if last { ell } else { tee },
                               c.name, kind_mark(c), extra));
         if c.kind == Kind::Dir {
             let p = format!("{prefix}{}", if last { gap } else { pipe });
-            tree(c, &p, level + 1, st, total, out);
+            tree(c, &cpath, &p, level + 1, st, total, out);
         }
     }
     if !rest.is_empty() {

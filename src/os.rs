@@ -87,6 +87,56 @@ pub fn is_reparse_dir(md: &Metadata) -> bool {
     }
 }
 
+/// The owner of a file or folder for `--long`: `DOMAIN\name` on Windows, the user name on Linux/macOS. Never
+/// follows a link (the link's own owner). An owner that cannot be named is shown as its SID (Windows) or uid
+/// (Unix); "?" only when the entry itself could not be asked (no permission to read its security data).
+/// Names are cached per SID / uid: a listing of 10,000 files owned by one account looks the name up once.
+pub fn owner(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        win::owner(path).unwrap_or_else(|| "?".into())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::symlink_metadata(path) {
+            Ok(m) => unix_user(m.uid()),
+            Err(_) => "?".into(),
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = path;
+        "?".into()
+    }
+}
+
+/// uid -> user name from /etc/passwd, read once (no libc crate, no NSS: a name that lives only in LDAP or
+/// systemd-homed is not in that file and is shown as its uid).
+#[cfg(unix)]
+fn unix_user(uid: u32) -> String {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static USERS: OnceLock<HashMap<u32, String>> = OnceLock::new();
+    let users = USERS.get_or_init(|| parse_passwd(&std::fs::read_to_string("/etc/passwd").unwrap_or_default()));
+    users.get(&uid).cloned().unwrap_or_else(|| uid.to_string())
+}
+
+/// name:password:uid:gid:gecos:home:shell, one per line; comments and malformed lines skipped. The first name
+/// for a uid wins (as getpwuid does).
+pub fn parse_passwd(text: &str) -> std::collections::HashMap<u32, String> {
+    let mut m = std::collections::HashMap::new();
+    for l in text.lines().filter(|l| !l.starts_with('#')) {
+        let f: Vec<&str> = l.split(':').collect();
+        if f.len() >= 3 && !f[0].is_empty() {
+            if let Ok(uid) = f[2].parse::<u32>() {
+                m.entry(uid).or_insert_with(|| f[0].to_string());
+            }
+        }
+    }
+    m
+}
+
 pub fn round_up(n: u64, unit: u64) -> u64 {
     if unit <= 1 {
         n
@@ -249,6 +299,91 @@ pub mod win {
         Some(spc as u64 * bps as u64)
     }
 
+    /// Owner of `p` as DOMAIN\name, else the SID string; None when its security data cannot be read.
+    ///
+    /// The handle is opened with FILE_FLAG_OPEN_REPARSE_POINT and asked with GetSecurityInfo, not
+    /// GetNamedSecurityInfoW on the name: the named call follows a symlink or junction to its target, and
+    /// gorilla-size never follows one (a junction's own owner is shown, not the owner of where it points).
+    ///
+    /// LookupAccountSidW runs locally for local accounts and the well-known ones (BUILTIN, NT AUTHORITY). For a
+    /// DOMAIN account's SID Windows may ask a domain controller over the network; this program makes no
+    /// connection of its own, and the owner's laptop is not domain-joined, so no such query happens there. On a
+    /// domain-joined machine `--long` can cause that lookup; nothing else in gorilla-size does.
+    pub fn owner(p: &Path) -> Option<String> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn GetSecurityInfo(h: Handle, object_type: u32, info: u32, owner: *mut *mut c_void,
+                               group: *mut *mut c_void, dacl: *mut *mut c_void, sacl: *mut *mut c_void,
+                               sd: *mut *mut c_void) -> u32;
+            fn ConvertSidToStringSidW(sid: *mut c_void, out: *mut *mut u16) -> i32;
+            fn LookupAccountSidW(system: *const u16, sid: *mut c_void, name: *mut u16, name_len: *mut u32,
+                                 domain: *mut u16, domain_len: *mut u32, sid_use: *mut u32) -> i32;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LocalFree(mem: *mut c_void) -> *mut c_void;
+        }
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const SHARE_ALL: u32 = 7;
+        const OPEN_EXISTING: u32 = 3;
+        const BACKUP_SEMANTICS: u32 = 0x0200_0000; // needed to open a folder
+        const OPEN_REPARSE_POINT: u32 = 0x0020_0000; // the link itself, never its target
+        const SE_FILE_OBJECT: u32 = 1;
+        const OWNER_SECURITY_INFORMATION: u32 = 1;
+        static NAMES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+        let w = wide(p);
+        unsafe {
+            let h = CreateFileW(w.as_ptr(), READ_CONTROL, SHARE_ALL, std::ptr::null_mut(), OPEN_EXISTING,
+                                BACKUP_SEMANTICS | OPEN_REPARSE_POINT, std::ptr::null_mut());
+            if h == INVALID {
+                return None;
+            }
+            let (mut sid, mut sd) = (std::ptr::null_mut(), std::ptr::null_mut());
+            let rc = GetSecurityInfo(h, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &mut sid, std::ptr::null_mut(),
+                                     std::ptr::null_mut(), std::ptr::null_mut(), &mut sd);
+            CloseHandle(h);
+            if rc != 0 || sid.is_null() {
+                if !sd.is_null() {
+                    LocalFree(sd);
+                }
+                return None;
+            }
+            // `sid` points into `sd`: everything below happens before sd is freed
+            let mut s: *mut u16 = std::ptr::null_mut();
+            let key = if ConvertSidToStringSidW(sid, &mut s) != 0 {
+                let n = (0..).take_while(|&i| *s.add(i) != 0).count();
+                let k = String::from_utf16_lossy(std::slice::from_raw_parts(s, n));
+                LocalFree(s as *mut c_void);
+                k
+            } else {
+                LocalFree(sd);
+                return None;
+            };
+            let cache = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+            if let Some(n) = cache.lock().unwrap().get(&key) {
+                LocalFree(sd);
+                return Some(n.clone());
+            }
+            let (mut name, mut domain) = (vec![0u16; 256], vec![0u16; 256]);
+            let (mut nl, mut dl, mut used) = (name.len() as u32, domain.len() as u32, 0u32);
+            let ok = LookupAccountSidW(std::ptr::null(), sid, name.as_mut_ptr(), &mut nl, domain.as_mut_ptr(),
+                                       &mut dl, &mut used);
+            LocalFree(sd);
+            let shown = if ok != 0 {
+                let n = String::from_utf16_lossy(&name[..nl as usize]);
+                let d = String::from_utf16_lossy(&domain[..dl as usize]);
+                if d.is_empty() { n } else { format!("{d}\\{n}") }
+            } else {
+                key.clone() // a deleted account, or a SID from another machine: the SID itself
+            };
+            cache.lock().unwrap().insert(key, shown.clone());
+            Some(shown)
+        }
+    }
+
     pub fn is_admin() -> bool {
         const TOKEN_QUERY: u32 = 8;
         const TOKEN_ELEVATION: u32 = 20;
@@ -277,5 +412,23 @@ mod tests {
         assert_eq!(round_up(4096, 4096), 4096);
         assert_eq!(round_up(4097, 4096), 8192);
         assert_eq!(round_up(5, 1), 5);
+    }
+
+    #[test]
+    fn passwd_lines_give_names_by_uid() {
+        let m = parse_passwd("# comment\nroot:x:0:0:root:/root:/bin/bash\nbroken line\nann:x:1000:1000::/srv/ann:/bin/sh\n\
+                              dup:x:1000:1000::/x:/bin/sh\n:x:5:5::/:/x\n");
+        assert_eq!(m.get(&0).map(String::as_str), Some("root"));
+        assert_eq!(m.get(&1000).map(String::as_str), Some("ann"), "the first name for a uid wins");
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn the_owner_of_a_file_made_here_has_a_name() {
+        let p = std::env::temp_dir().join(format!("gs-owner-{}", std::process::id()));
+        std::fs::write(&p, b"x").unwrap();
+        let o = owner(&p);
+        std::fs::remove_file(&p).unwrap();
+        assert!(!o.is_empty() && o != "?", "{o}");
     }
 }

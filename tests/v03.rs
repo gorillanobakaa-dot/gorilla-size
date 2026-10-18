@@ -378,3 +378,21 @@ fn under_json_an_error_is_json_on_stdout() {
     assert_eq!((rc, out.as_str()), (2, ""));
     assert!(err.contains("does not exist"), "{err}");
 }
+#[test]
+fn long_shows_the_owner_of_each_entry() {
+    let t = tmp("owner");
+    file(&t.0.join("mine.txt"), b"x");
+    file(&t.0.join("sub/inner.txt"), b"xy");
+    let (rc, out, err) = run(&[s(&t.0), "--long", "-d", "2", "--ascii"]);
+    assert_eq!(rc, 0, "{err}");
+    // ... attrs DATE  OWNER  |-- name   (the owner sits between the date and the tree branch)
+    let re = regex::Regex::new(r"\d{4}-\d{2}-\d{2}  (\S.*?)\s{2,}(?:\|   |    )*(?:\|-- |`-- )(\S+)").unwrap();
+    for name in ["mine.txt", "inner.txt", "sub/"] {
+        let line = out.lines().find(|l| l.contains(name)).unwrap_or_else(|| panic!("{name}:\n{out}"));
+        let c = re.captures(line).unwrap_or_else(|| panic!("no owner column: {line}"));
+        let owner = c[1].trim();
+        assert!(!owner.is_empty() && owner != "?", "owner of {name}: {owner:?} in {line}");
+    }
+    let (_, flat, _) = run(&[s(&t.0), "--long", "--flat", "-d", "2"]);
+    assert!(flat.lines().filter(|l| l.contains("inner.txt")).all(|l| !l.contains(" ?  ")), "{flat}");
+}

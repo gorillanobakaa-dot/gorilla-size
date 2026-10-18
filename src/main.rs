@@ -65,7 +65,7 @@ REPORT OPTIONS
   --gitignore          skip what .gitignore files ignore   --exclude PAT    skip (gitignore syntax; repeatable)
   --no-hidden          skip hidden entries                 --cross-filesystems  (Unix) enter other mounts
   --reverse            smallest first                      --flat           one list of paths at --depth
-  --long               attributes/permissions and date     --progress       live count on stderr
+  --long               attributes/permissions, date, owner --progress       live count on stderr
   --list-links  --list-errors  --strict (exit 3 when anything was unreadable)
   --mft                (Windows, administrator) read the NTFS master file table: a whole drive in seconds
   -j, --threads N      worker threads (default: the calibrated count for that disk, else every core)

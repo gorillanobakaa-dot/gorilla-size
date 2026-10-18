@@ -97,7 +97,7 @@ gorilla-size newest|oldest [PATH ...]  gorilla-size watch PATH --every 60 gorill
 | `--links` | Windows: count a hard-linked file once (opens every file: much slower). Linux/macOS always do |
 | `--gitignore`, `--exclude PAT` | skip what .gitignore files ignore; skip a pattern (gitignore syntax, repeatable) |
 | `--no-hidden` | skip hidden entries (the count of what was skipped is reported) |
-| `--reverse`, `--flat`, `--long` | smallest first; one flat list at `--depth`; attributes/permissions and dates |
+| `--reverse`, `--flat`, `--long` | smallest first; one flat list at `--depth`; attributes/permissions, dates and the owner (Windows `DOMAIN\name`, else the SID; Linux the user name from `/etc/passwd`, else the uid) |
 | `--progress` | live count on stderr for long scans |
 | `--cross-filesystems` | Linux/macOS: enter other mounted file systems too (default: stay on one) |
 | `--list-links`, `--list-errors`, `--strict` | what was not followed / not readable; exit 3 if anything was unreadable |
@@ -246,7 +246,10 @@ reading the output always gets JSON; without `--json` it is one line on standard
 
 ## 11. Security: doors open and closed
 
-- **Network:** none. No update check, no telemetry, no download. The program contains no network code.
+- **Network:** none. No update check, no telemetry, no download. The program contains no network code. One
+  indirect door, closed on a machine that is not in a Windows domain: `--long` names file owners with Windows'
+  `LookupAccountSidW`, which for a **domain** account may ask the domain controller. Local and built-in accounts
+  are looked up locally. Without `--long` it is never called.
 - **What it changes:** only what you ask with `copy`, `move`, `recycle`, `undo` and `apply`; everything else reads.
   It never deletes for good.
 - **Dependencies:** 15 crates, vendored in `vendor/` with their checksums (`DEPENDENCIES.md` says why each one is
