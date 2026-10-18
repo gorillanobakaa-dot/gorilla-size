@@ -317,6 +317,35 @@ pub fn calibrate(sample: &Path, rounds: usize, mut progress: impl FnMut(&str)) -
     v
 }
 
+/// `bench --profile`: walk `sample` with `a` threads and with `b` threads, alternating (a b, b a, ...) after one
+/// warm-up walk each, `rounds` times. Returns the seconds of every run of each. Both pools are built once, before
+/// timing, so thread start-up is not in the numbers. The walk is the one calibration times (totals only), so the
+/// bench checks exactly the claim the profile makes.
+pub fn bench_threads(sample: &Path, a: usize, b: usize, rounds: usize) -> (Vec<f64>, Vec<f64>) {
+    let pa = rayon::ThreadPoolBuilder::new().num_threads(a.max(1)).build().expect("thread pool");
+    let pb = rayon::ThreadPoolBuilder::new().num_threads(b.max(1)).build().expect("thread pool");
+    let once = |pool: &rayon::ThreadPool| -> f64 {
+        let t = Instant::now();
+        pool.install(|| {
+            let _ = crate::walk::run(sample, crate::walk::Opts::totals_only());
+        });
+        t.elapsed().as_secs_f64()
+    };
+    once(&pa);
+    once(&pb);
+    let (mut ta, mut tb) = (Vec::with_capacity(rounds), Vec::with_capacity(rounds));
+    for r in 0..rounds {
+        if r % 2 == 0 {
+            ta.push(once(&pa));
+            tb.push(once(&pb));
+        } else {
+            tb.push(once(&pb));
+            ta.push(once(&pa));
+        }
+    }
+    (ta, tb)
+}
+
 pub fn show() -> Value {
     let m = machine();
     let saved = load();

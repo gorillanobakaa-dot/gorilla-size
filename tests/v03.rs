@@ -59,3 +59,50 @@ fn profile_says_which_sha256_path_hash_uses() {
     let (_, text, _) = run(&["profile"]);
     assert!(text.contains(&format!("SHA-256  {imp}")), "{text}");
 }
+
+/// Run with an empty state folder: no machine.json, no journal of the owner's touched.
+fn run_fresh_state(args: &[&str], state: &Path) -> (i32, String, String) {
+    let o = Command::new(BIN).args(args).env("LOCALAPPDATA", state).env("XDG_STATE_HOME", state).output().unwrap();
+    (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).into(), String::from_utf8_lossy(&o.stderr).into())
+}
+
+#[test]
+fn bench_profile_measures_the_calibrated_count_against_every_core() {
+    let t = tmp("benchprof");
+    for i in 0..300 {
+        file(&t.0.join(format!("d{}/f{i}", i % 30)), b"x");
+    }
+    let (rc, v) = json_rc(&["bench", "--profile", s(&t.0), "-j", "1", "--rounds", "3"]);
+    assert_eq!(rc, 0, "{v}");
+    assert_eq!(v["profile_threads"], 1);
+    assert_eq!(v["threads_from"], "asked (-j)");
+    assert_eq!(v["profile_seconds"].as_array().unwrap().len(), 3);
+    assert_eq!(v["all_seconds"].as_array().unwrap().len(), 3);
+    for side in ["profile", "all"] {
+        let sp = &v[side];
+        let (lo, q1, med, q3, hi) = (sp["min"].as_f64().unwrap(), sp["q1"].as_f64().unwrap(),
+                                     sp["median"].as_f64().unwrap(), sp["q3"].as_f64().unwrap(),
+                                     sp["max"].as_f64().unwrap());
+        assert!(lo <= q1 && q1 <= med && med <= q3 && q3 <= hi, "{side}: {sp}");
+    }
+    let verdict = v["verdict"].as_str().unwrap();
+    assert!(verdict.starts_with("INCONCLUSIVE") || verdict.contains("FASTER"), "{verdict}");
+    // no calibration for this disk and no -j: nothing to test, refused (fail closed), not a silent "every core"
+    let state = t.0.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let (rc, out, err) = run_fresh_state(&["bench", "--profile", s(&t.0)], &state);
+    assert_eq!(rc, 2, "{out}{err}");
+    assert!(err.contains("no calibrated thread count"), "{err}");
+}
+
+#[test]
+fn bench_runs_ten_rounds_unless_told_otherwise() {
+    // plan item 300: the default was 3 rounds
+    // bench's own --json goes before `--`; after it everything belongs to the two programs
+    let (rc, out, err) = run(&["bench", BIN, BIN, "--json", "--", "--version"]);
+    assert_eq!(rc, 0, "{err}{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["rounds"], 10);
+    assert_eq!(v["a_seconds"].as_array().unwrap().len(), 10);
+    assert!(v["a_spread"]["max"].as_f64().unwrap() >= v["a_spread"]["min"].as_f64().unwrap());
+}

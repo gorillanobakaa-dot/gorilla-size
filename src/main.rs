@@ -49,6 +49,9 @@ ACT (verified, journalled, undoable; never a permanent delete)
 MACHINE
   gorilla-size bench A B [--rounds N] -- ARGS   two programs, same ARGS, alternating; a verdict only when the
                                            middle halves of the runs do not overlap, else INCONCLUSIVE
+  gorilla-size bench --profile [PATH] [-j N] [--rounds N]   the calibrated thread count (or -j N) against every
+                                           core, walking PATH, alternating; median, middle half, min-max, verdict
+                                           (both benches: 10 rounds unless --rounds; never fewer than 3)
   gorilla-size profile                     this machine, its SHA-256 path, the calibrated thread count per disk
   gorilla-size profile --recalibrate [SAMPLE] [--rounds N]   measure 1..N threads on SAMPLE, keep the fastest
 
@@ -138,7 +141,8 @@ struct Args {
     every: Option<u64>,
     count: Option<u64>,
     recalibrate: bool,
-    rounds: usize,
+    rounds: Option<usize>,
+    bench_profile: bool,
 }
 
 const MODES: [&str; 20] = ["find", "compare", "types", "newest", "oldest", "watch", "free", "hash", "dupes", "empty",
@@ -147,7 +151,7 @@ const MODES: [&str; 20] = ["find", "compare", "types", "newest", "oldest", "watc
 
 fn parse(argv: Vec<String>) -> Result<Args, String> {
     let mut a = Args { mode: "report".into(), depth: 1, sort: "size".into(), max_bytes: 16384, max_hits: 20,
-                       plan_files: 1000, plan_bytes: 10 << 30, rounds: 3,
+                       plan_files: 1000, plan_bytes: 10 << 30,
                        ignore_case: cfg!(any(windows, target_os = "macos")), ..Default::default() };
     let mut it = argv.into_iter().peekable();
     if let Some(first) = it.peek() {
@@ -246,7 +250,8 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--every" => a.every = Some(num(val("--every")?, "--every")? as u64),
             "--count" => a.count = Some(num(val("--count")?, "--count")? as u64),
             "--recalibrate" => a.recalibrate = true,
-            "--rounds" => a.rounds = num(val("--rounds")?, "--rounds")?.max(1),
+            "--rounds" => a.rounds = Some(num(val("--rounds")?, "--rounds")?.max(1)),
+            "--profile" => a.bench_profile = true,
             x => return Err(format!("unknown option {x} (--help lists them)")),
         }
     }
@@ -328,6 +333,22 @@ fn need_paths(a: &Args, what: &str) -> Option<u8> {
 
 fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap());
+}
+
+/// An error the caller must see, and its exit code. Under --json it is one JSON object on STDOUT,
+/// {"error": "...", "exit": n}, so a program that parses stdout gets an answer it can read instead of an empty
+/// stream and a sentence on stderr (plan section 1: the error contract). Otherwise one line on stderr.
+fn fail(a: &Args, code: u8, msg: impl std::fmt::Display) -> u8 {
+    fail_as(a.json, code, &format!("gorilla-size {}: {msg}", a.mode))
+}
+
+fn fail_as(json: bool, code: u8, msg: &str) -> u8 {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&json!({"error": msg, "exit": code})).unwrap());
+    } else {
+        eprintln!("{msg}");
+    }
+    code
 }
 
 // ----------------------------------------------------------------------------------------------------- measure
@@ -1004,11 +1025,13 @@ fn run_trash(a: &Args) -> u8 {
 /// each, and give a verdict only when the two spreads do not overlap. 2026-10-16: a hand-run comparison said 12
 /// threads were slower than the default, which also used 12: one run is nothing (the confirm rule).
 fn run_bench(a: &Args, rest: &[String]) -> u8 {
-    if a.paths.len() != 2 {
-        eprintln!("gorilla-size bench: give two programs, then -- and the arguments for both");
-        return 2;
+    if a.bench_profile {
+        return run_bench_profile(a);
     }
-    let rounds = a.rounds.max(3);
+    if a.paths.len() != 2 {
+        return fail(a, 2, "bench: give two programs, then -- and the arguments for both (or --profile PATH)");
+    }
+    let rounds = bench_rounds(a);
     let run = |exe: &Path| -> Option<f64> {
         let t = Instant::now();
         let ok = std::process::Command::new(exe).args(rest).stdout(std::process::Stdio::null())
@@ -1017,8 +1040,7 @@ fn run_bench(a: &Args, rest: &[String]) -> u8 {
     };
     let (ea, eb) = (&a.paths[0], &a.paths[1]);
     if run(ea).is_none() || run(eb).is_none() {
-        eprintln!("gorilla-size bench: a program failed with those arguments (warm-up)");
-        return 3;
+        return fail(a, 3, "bench: a program failed with those arguments (warm-up)");
     }
     let (mut ta, mut tb) = (Vec::new(), Vec::new());
     for r in 0..rounds {
@@ -1027,35 +1049,107 @@ fn run_bench(a: &Args, rest: &[String]) -> u8 {
             match run(exe) {
                 Some(s) if is_a => ta.push(s),
                 Some(s) => tb.push(s),
-                None => {
-                    eprintln!("gorilla-size bench: {} failed in round {}", exe.display(), r + 1);
-                    return 3;
-                }
+                None => return fail(a, 3, format!("bench: {} failed in round {}", exe.display(), r + 1)),
             }
         }
     }
-    let stats = |v: &mut Vec<f64>| {
-        v.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        let q = |f: f64| v[((v.len() - 1) as f64 * f).round() as usize];
-        (q(0.5), q(0.25), q(0.75))
-    };
-    let (ma, la, ha) = stats(&mut ta);
-    let (mb, lb, hb) = stats(&mut tb);
-    let verdict = if ha < lb {
-        format!("A FASTER: {:.2}x", mb / ma)
-    } else if hb < la {
-        format!("B FASTER: {:.2}x", ma / mb)
-    } else {
-        "INCONCLUSIVE: the middle halves of the runs overlap (more --rounds, or a quieter machine)".to_string()
-    };
+    let (sa, sb) = (Spread::of(&mut ta), Spread::of(&mut tb));
+    let verdict = verdict(&sa, &sb, "A", "B");
     if a.json {
         print_json(&json!({"a": ea.display().to_string(), "b": eb.display().to_string(), "args": rest,
-                           "rounds": rounds, "a_seconds": ta, "b_seconds": tb, "a_median": ma, "b_median": mb,
+                           "rounds": rounds, "a_seconds": ta, "b_seconds": tb, "a_median": sa.median,
+                           "b_median": sb.median, "a_spread": sa.json(), "b_spread": sb.json(),
                            "verdict": verdict}));
     } else {
-        println!("A {}  median {ma:.3} s  (middle half {la:.3}-{ha:.3})", ea.display());
-        println!("B {}  median {mb:.3} s  (middle half {lb:.3}-{hb:.3})", eb.display());
+        println!("A {}  {}", ea.display(), sa.text());
+        println!("B {}  {}", eb.display(), sb.text());
         println!("{rounds} alternating rounds after a warm-up each. {verdict}");
+    }
+    0
+}
+
+/// Rounds for both benches: 10 unless --rounds says otherwise (plan item 300: 3 rounds gave verdicts that the
+/// next 3 did not repeat), never fewer than 3, because a middle half of 2 runs is meaningless.
+fn bench_rounds(a: &Args) -> usize {
+    a.rounds.unwrap_or(10).max(3)
+}
+
+/// The spread of one side of a bench: median, middle half (25th..75th percentile) and the extremes.
+struct Spread {
+    median: f64,
+    q1: f64,
+    q3: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Spread {
+    /// sorts `v` (the JSON then lists the runs fastest first)
+    fn of(v: &mut [f64]) -> Spread {
+        v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let q = |f: f64| v[((v.len() - 1) as f64 * f).round() as usize];
+        Spread { median: q(0.5), q1: q(0.25), q3: q(0.75), min: v[0], max: v[v.len() - 1] }
+    }
+
+    fn json(&self) -> Value {
+        json!({"median": self.median, "q1": self.q1, "q3": self.q3, "min": self.min, "max": self.max})
+    }
+
+    fn text(&self) -> String {
+        // four decimals: a folder walked in 2 ms shows its spread instead of "0.002-0.002"
+        format!("median {:.4} s  (middle half {:.4}-{:.4}, all runs {:.4}-{:.4})", self.median, self.q1, self.q3,
+                self.min, self.max)
+    }
+}
+
+/// A verdict only when the middle halves do not overlap; otherwise INCONCLUSIVE. Medians alone would call a
+/// winner on noise (2026-10-16: "12 threads slower than the default", which also used 12).
+fn verdict(a: &Spread, b: &Spread, an: &str, bn: &str) -> String {
+    if a.q3 < b.q1 {
+        format!("{an} FASTER: {:.2}x", b.median / a.median)
+    } else if b.q3 < a.q1 {
+        format!("{bn} FASTER: {:.2}x", a.median / b.median)
+    } else {
+        "INCONCLUSIVE: the middle halves of the runs overlap (more --rounds, or a quieter machine)".to_string()
+    }
+}
+
+/// bench --profile [PATH] [-j N] [--rounds N]: is the calibrated thread count really faster than every core on
+/// this folder? The same walk, in this process, with two thread pools, alternating, after a warm-up of each (plan
+/// section 3 item 4: "a profile that is not proven is a claim"). -j N names the count to test instead of the
+/// profile's. Fails closed: with no calibration for this disk and no -j there is nothing to test, exit 2.
+fn run_bench_profile(a: &Args) -> u8 {
+    let root = absolute(a.paths.first().map(|p| p.as_path()).unwrap_or(Path::new(".")));
+    if std::fs::symlink_metadata(&root).is_err() {
+        return fail(a, 2, format!("bench --profile: {} does not exist", root.display()));
+    }
+    let all = profile::machine().logical;
+    let (cand, from) = match a.threads {
+        Some(n) => (n.clamp(1, all), "asked (-j)"),
+        None => match profile::threads_for(&root) {
+            Some(n) => (n.clamp(1, all), "profile"),
+            None => return fail(a, 2, format!("bench --profile: no calibrated thread count for the disk of {} \
+                                               (run profile --recalibrate there first, or name one with -j N)",
+                                              root.display())),
+        },
+    };
+    let rounds = bench_rounds(a);
+    let (mut tp, mut ta) = profile::bench_threads(&root, cand, all, rounds);
+    let (sp, sa) = (Spread::of(&mut tp), Spread::of(&mut ta));
+    let verdict = verdict(&sp, &sa, "PROFILE", "EVERY CORE");
+    let same = cand == all;
+    if a.json {
+        print_json(&json!({"mode": "bench-profile", "path": root.display().to_string(), "rounds": rounds,
+                           "profile_threads": cand, "threads_from": from, "all_threads": all,
+                           "same_setting": same, "profile_seconds": tp, "all_seconds": ta,
+                           "profile": sp.json(), "all": sa.json(), "verdict": verdict}));
+    } else {
+        println!("profile     {cand:>3} threads ({from})  {}", sp.text());
+        println!("every core  {all:>3} threads  {}", sa.text());
+        if same {
+            println!("(the profile already uses every core: both sides are the same setting)");
+        }
+        println!("{rounds} alternating rounds after a warm-up each, walking {}. {verdict}", root.display());
     }
     0
 }
@@ -1063,7 +1157,7 @@ fn run_bench(a: &Args, rest: &[String]) -> u8 {
 fn run_profile(a: &Args) -> u8 {
     if a.recalibrate {
         let sample = absolute(a.paths.first().map(|p| p.as_path()).unwrap_or(Path::new(".")));
-        let v = profile::calibrate(&sample, a.rounds, |s| eprintln!("  {s}"));
+        let v = profile::calibrate(&sample, a.rounds.unwrap_or(3), |s| eprintln!("  {s}"));
         let (id, _) = profile::volume(&sample);
         if a.json {
             print_json(&v);

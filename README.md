@@ -164,6 +164,13 @@ below, 256 MiB in memory: portable 143 MiB/s, SHA-NI 1,047 MiB/s (7.3x), same di
 several rounds, and keeps the fastest count for that disk in `%LOCALAPPDATA%\gorilla\machine.json`
 (`~/.local/state/gorilla/machine.json`). Every later run on that disk uses it. A different CPU makes it re-measure.
 
+**Is the profile right?** `gorilla-size bench --profile FOLDER` walks FOLDER with the calibrated count and with
+every core, alternating, 10 rounds (`--rounds N`) after a warm-up of each, and prints the median, the middle half
+and the fastest/slowest run of each. It names a winner only when the middle halves do not overlap; otherwise it says
+INCONCLUSIVE. `-j N` tests another count instead of the profile's. With no calibration for that disk and no `-j`
+there is nothing to test: it stops with exit 2. `gorilla-size bench A B -- ARGS` does the same for two programs
+(also 10 rounds by default since 0.3.0; it was 3).
+
 Measured on the laptop above: 1 thread 7.6 s, 4 threads 2.6 s, 8 to 12 threads 1.4 s (equal within noise). On a fast
 SSD every core is already best; the profile earns its keep on hard disks, USB sticks and older machines, where too
 many threads make the disk slower. The calibration runs with a warm cache: it measures day-to-day use, not the first
