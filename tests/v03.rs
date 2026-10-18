@@ -205,3 +205,125 @@ fn find_format_prints_a_file_named_like_a_placeholder_as_its_name() {
     assert_eq!(rc, 0, "{err}");
     assert_eq!(out.lines().collect::<Vec<_>>(), vec!["{bytes}.txt=5", "{size} and {path}.log=1"], "{out}");
 }
+/// Run to the end; return (exit code, stdout, the child's peak private memory in bytes).
+/// Windows: PeakPagefileUsage from K32GetProcessMemoryInfo (still readable after the exit while the handle is
+/// open). Linux: getrusage(RUSAGE_CHILDREN) max RSS (the largest child of this test process so far; every other
+/// child the tests start walks a few files and stays far below the limits used here).
+fn run_measured(args: &[&str]) -> (i32, String, u64) {
+    use std::io::Read;
+    let mut child = Command::new(BIN).args(args).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut out = String::new();
+    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    let rc = child.wait().unwrap().code().unwrap_or(-1);
+    (rc, out, peak_memory(&child))
+}
+
+#[cfg(windows)]
+fn peak_memory(child: &std::process::Child) -> u64 {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters { cb: u32, faults: u32, peak_ws: usize, ws: usize, qpp_peak: usize, qpp: usize, qnp_peak: usize,
+                      qnp: usize, pagefile: usize, peak_pagefile: usize }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn K32GetProcessMemoryInfo(h: *mut std::ffi::c_void, c: *mut Counters, cb: u32) -> i32;
+    }
+    let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
+    assert_ne!(unsafe { K32GetProcessMemoryInfo(child.as_raw_handle() as _, &mut c, c.cb) }, 0);
+    c.peak_pagefile as u64
+}
+
+#[cfg(target_os = "linux")]
+fn peak_memory(_child: &std::process::Child) -> u64 {
+    #[repr(C)]
+    struct Rusage { utime: [i64; 2], stime: [i64; 2], maxrss: i64, rest: [i64; 13] }
+    extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+    let mut r = Rusage { utime: [0; 2], stime: [0; 2], maxrss: 0, rest: [0; 13] };
+    assert_eq!(unsafe { getrusage(-1, &mut r) }, 0); // RUSAGE_CHILDREN
+    r.maxrss as u64 * 1024
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn peak_memory(_child: &std::process::Child) -> u64 {
+    0 // not measured here; the output checks still run
+}
+
+#[test]
+fn a_huge_file_without_line_ends_is_read_only_up_to_max_bytes() {
+    // 2026-10-18 audit: --head/--grep read a whole line before capping it; a 64 MiB file with no newline was
+    // pulled into memory in full (twice: bytes, then text)
+    use std::io::Write;
+    let t = tmp("noline");
+    let mut f = fs::File::create(t.0.join("dump.txt")).unwrap();
+    let chunk = vec![b'a'; 1 << 20];
+    for _ in 0..64 {
+        f.write_all(&chunk).unwrap();
+    }
+    drop(f);
+    const LIMIT: u64 = 32 << 20;
+    let (rc, out, peak) = run_measured(&["find", s(&t.0), "--ext", "txt", "--head", "1", "--max-bytes", "4K"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("(truncated at 4096 bytes"), "{out}");
+    let shown = out.lines().find(|l| l.contains("1| a")).unwrap_or_else(|| panic!("{out}"));
+    assert!(shown.len() <= 4096 + 16, "{} bytes shown", shown.len());
+    assert!(peak < LIMIT, "--head 1 peaked at {peak} bytes");
+    let (rc, out, peak) = run_measured(&["find", s(&t.0), "--ext", "txt", "--grep", "aaa", "--max-bytes", "4K"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("1 line(s) longer than --max-bytes: truncated at 4096 bytes"), "{out}");
+    assert!(peak < LIMIT, "--grep peaked at {peak} bytes");
+    let (rc, out, peak) = run_measured(&["find", s(&t.0), "--ext", "txt", "--tail", "1", "--max-bytes", "4K"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("truncated at 4096 bytes"), "{out}");
+    assert!(peak < LIMIT, "--tail 1 peaked at {peak} bytes");
+}
+
+#[test]
+fn a_binary_file_is_summarized_with_size_kind_and_first_bytes() {
+    let t = tmp("binsum");
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    png.resize(100, 0);
+    file(&t.0.join("a-image.png"), &png);
+    let mut exe = b"MZ\x90\0".to_vec();
+    exe.resize(64, 0);
+    file(&t.0.join("b-program.log"), &exe); // the name says log; the bytes say Windows program
+    file(&t.0.join("c-blob.dat"), &[0, 1, 2, 3]);
+    let (rc, out, err) = run(&["find", s(&t.0), "--type", "f", "--sort", "name", "--head", "1"]);
+    assert_eq!(rc, 0, "{err}");
+    assert!(out.contains("binary file: not shown; 100 B, PNG, first 16 bytes 89 50 4e 47 0d 0a 1a 0a 00 00 00 0d 49 48 44 52"),
+            "{out}");
+    assert!(out.contains("64 B, PE/MZ, first 16 bytes 4d 5a 90 00"), "{out}");
+    assert!(out.contains("4 B, kind unknown, first 4 bytes 00 01 02 03"), "{out}");
+    let (_, out, _) = run(&["find", s(&t.0), "--name", "a-image.png", "--head", "1", "--jsonl"]);
+    let v: Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+    assert_eq!(v["content"]["binary"], true);
+    assert_eq!(v["content"]["kind"], "PNG");
+    assert_eq!(v["content"]["bytes"], 100);
+    assert_eq!(v["content"]["first_bytes"], "89504e470d0a1a0a0000000d49484452");
+}
+
+#[test]
+fn find_hashes_only_what_grep_kept() {
+    let t = tmp("hashgrep");
+    file(&t.0.join("a.log"), b"all fine\n");
+    file(&t.0.join("b.log"), b"ERROR disk full\n");
+    file(&t.0.join("c.log"), b"fine too\n");
+    file(&t.0.join("sub/d.log"), b"nothing\n");
+    let (_, want) = json_rc(&["hash", s(&t.0.join("b.log"))]);
+    let (rc, v) = json_rc(&["find", s(&t.0), "--ext", "log", "--grep", "ERROR", "--hash"]);
+    assert_eq!(rc, 0, "{v}");
+    let found = v["roots"][0]["found"].as_array().unwrap();
+    assert_eq!(found.len(), 1, "grep selects: {v}");
+    assert!(found[0]["path"].as_str().unwrap().ends_with("b.log"));
+    assert_eq!(found[0]["sha256"], want[0]["sha256"]);
+    assert_eq!(v["grep_dropped"], 3, "{v}");
+    assert_eq!(v["hashed"], 1, "nothing grep dropped was hashed: {v}");
+    let (_, out, _) = run(&["find", s(&t.0), "--ext", "log", "--grep", "ERROR", "--hash"]);
+    let sha = want[0]["sha256"].as_str().unwrap();
+    assert!(out.lines().any(|l| l.contains(sha) && l.ends_with("b.log")), "{out}");
+    assert!(!out.contains("a.log") && !out.contains("c.log"), "{out}");
+    let (_, out, _) = run(&["find", s(&t.0), "--name", "b.log", "--hash", "--format", "{sha256}  {name}"]);
+    assert_eq!(out.trim_end(), format!("{sha}  b.log"));
+}

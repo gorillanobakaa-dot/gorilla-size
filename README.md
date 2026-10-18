@@ -133,10 +133,20 @@ gorilla-size find [FILTERS] [OUTPUT] [READ] [PATH ...]
   `--older 1y`, `--type f|d|l`, `--sort size|name|age`, `-n N`, `-i` / `-s` (case). A folder's size is everything
   under it, so `--type d --min-size 10G` finds the folders holding the space.
 - **Output for the next step:** `--paths` (one per line), `-0` (NUL-separated), `--jsonl` (one JSON object per line),
-  `--format '{path}\t{size}\t{date}'` (fields: path, name, bytes, size, kind, mtime, date).
+  `--format '{path}\t{size}\t{date}'` (fields: path, name, bytes, size, kind, mtime, date, sha256; a file whose
+  name looks like a field, such as `{bytes}.txt`, prints as its name).
+- **Search inside, as a filter:** `--grep TEXT` or `--grep-re RE` (one of them) keeps only the text files with at
+  least one matching line, and shows those lines (`--max-hits`, 20 per file). Folders, links and binary files are
+  dropped. Since 0.3.0; before, every matched file was listed, with or without a hit.
 - **Read in the same call:** `--head N`, `--tail N` (reads only the end, even of a 50 GiB log), `--lines A:B`,
-  `--grep TEXT`, `--grep-re RE`, capped by `--max-bytes` (16 KiB per file) and `--max-hits` (20 per file). Binary
-  files are recognized and never dumped.
+  capped by `--max-bytes` (16 KiB per file). The cap is on memory too: a line longer than `--max-bytes` (a 2 GiB
+  file with no line ends) is never read whole; the output says `truncated at N bytes`, and `--grep` searches only
+  the first N bytes of such a line and says how many lines that was. Binary files are never dumped: they are
+  summarized with their size, their kind when the first bytes tell it (PE/MZ, ELF, PNG, JPEG, GIF, ZIP, GZIP, PDF,
+  SQLite) and those first 16 bytes in hex.
+- **Hash what was found:** `--hash` adds the SHA-256 of every file listed, computed after every filter (grep
+  included) and after `-n`, so nothing that is not listed is read. `--json` reports `hashed`, `grep_dropped` and
+  each entry's `sha256`.
 - **Also:** `hash PATH ...` (SHA-256; on a CPU with the SHA extensions the hardware instructions are used, chosen
   at run time, and `--json` names the path in `sha256_impl`: `sha-ni` or `portable`), `dupes PATH ...` (size, then the first 64 KiB, then the full hash: unique
   sizes are never read), `empty PATH`, `reparse PATH` (every link, its target, broken or not).

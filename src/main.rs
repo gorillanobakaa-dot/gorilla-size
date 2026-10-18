@@ -74,10 +74,13 @@ REPORT OPTIONS
 FIND FILTERS AND OUTPUT
   --name GLOB  --regex RE  --ext a,b  --min-size S  --max-size S  --newer AGE  --older AGE  --type f|d|l
   --sort size|name|age   -n N   -i/--ignore-case  -s/--case-sensitive
-  --paths  -0/--print0  --jsonl  --format '{path}\\t{bytes}\\t{size}\\t{kind}\\t{date}\\t{name}'
-  --head N  --tail N  --lines A:B   (show those lines of each matched text file)   --max-bytes N (default 16384)
-  --grep TEXT   (lines of each matched file containing TEXT; -i folds case)   --grep-re RE (a regular expression)
-  --max-hits N  (default 20 per file)
+  --paths  -0/--print0  --jsonl  --format '{path}\\t{bytes}\\t{size}\\t{kind}\\t{date}\\t{name}\\t{sha256}'
+  --head N  --tail N  --lines A:B   (show those lines of each matched text file)   --max-bytes N (default 16384:
+                the most shown per file AND the most of one line held in memory; longer: truncated at N bytes)
+  --grep TEXT   keep only text files with a line containing TEXT, and show those lines (-i folds case)
+  --grep-re RE  the same with a regular expression (one of --grep, --grep-re)   --max-hits N (default 20 per file)
+  --hash        SHA-256 of every file listed, after all filters (grep included) and -n
+  binary files: size, kind (PE/MZ ELF PNG JPEG GIF ZIP GZIP PDF SQLite) and the first 16 bytes, never dumped
 
 LARGE OPERATIONS
   above --plan-files N (default 1000) or --plan-bytes S (default 10G) a move or recycle writes a PLAN and stops
@@ -148,6 +151,7 @@ struct Args {
     bench_profile: bool,
     alert_growth: Option<u64>,
     tree: bool,
+    hash: bool,
 }
 
 const MODES: [&str; 20] = ["find", "compare", "types", "newest", "oldest", "watch", "free", "hash", "dupes", "empty",
@@ -258,12 +262,17 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--rounds" => a.rounds = Some(num(val("--rounds")?, "--rounds")?.max(1)),
             "--profile" => a.bench_profile = true,
             "--tree" => a.tree = true,
+            "--hash" => a.hash = true,
             "--alert-growth" => a.alert_growth = Some(units::parse_size(&val("--alert-growth")?)?),
             x => return Err(format!("unknown option {x} (--help lists them)")),
         }
     }
     for r in a.regexes.iter().chain(a.grep_re.iter()) {
         regex::RegexBuilder::new(r).build().map_err(|e| format!("not a regular expression: {r}: {e}"))?;
+    }
+    if a.grep.is_some() && a.grep_re.is_some() {
+        // one selector: with both, which files "match" would be a guess
+        return Err("choose one of --grep, --grep-re".into());
     }
     let acts = [a.copy_to.is_some(), a.move_to.is_some(), a.recycle].iter().filter(|x| **x).count();
     if acts > 1 {
@@ -410,6 +419,7 @@ fn run_measure(a: &Args, threads_from: &str) -> u8 {
     let mut out = String::new();
     let mut any_errors = false;
     let mut all_found = Vec::new();
+    let (mut grep_dropped, mut hashed, mut hash_failed) = (0usize, 0usize, 0usize);
     let started = Instant::now();
     for p in &paths {
         let abs = absolute(p);
@@ -429,16 +439,33 @@ fn run_measure(a: &Args, threads_from: &str) -> u8 {
         } else {
             walk::run(&abs, opts(a, finding))
         };
+        let mut rep = rep;
+        // find: --grep/--grep-re select first, then sort and -n, then --hash: nothing grep drops (or -n cuts) is
+        // ever hashed
+        let found = if finding {
+            let (kept, dropped) = grep_select(std::mem::take(&mut rep.found), a);
+            grep_dropped += dropped;
+            kept
+        } else {
+            Vec::new()
+        };
         let secs = t0.elapsed().as_secs_f64();
         any_errors |= !rep.errors.is_empty();
         if finding {
-            all_found.extend(rep.found.clone());
+            all_found.extend(found.iter().cloned());
         }
         if a.json && !finding {
             roots_json.push(root_json(&rep, &abs, secs, a));
         } else if a.json {
             let mut r = root_json(&rep, &abs, secs, a);
-            r["found"] = output::found_json(&sorted_found(rep.found.clone(), a));
+            let mut sel = sorted_found(found, a);
+            let acting = a.copy_to.is_some() || a.move_to.is_some() || a.recycle;
+            if a.hash && !acting {
+                let (ok, bad) = hash_found(&mut sel);
+                hashed += ok;
+                hash_failed += bad;
+            }
+            r["found"] = output::found_json(&sel);
             roots_json.push(r);
         } else if !finding {
             let how = if a.mft { "NTFS master file table" } else if a.disk { "size on disk" } else { "apparent size" };
@@ -472,20 +499,34 @@ fn run_measure(a: &Args, threads_from: &str) -> u8 {
         return act(op, &items, to.as_deref(), a);
     }
     if a.json {
-        print_json(&json!({"tool": "gorilla-size", "version": VERSION, "mode": a.mode,
+        let mut v = json!({"tool": "gorilla-size", "version": VERSION, "mode": a.mode,
                            "engine": if a.mft { "mft" } else { "walk" },
                            "size": if a.disk { "disk" } else { "apparent" },
                            "hardlinks_counted_once": hardlinks_checked, "threads": rayon::current_num_threads(),
                            "threads_from": threads_from,
                            "seconds": (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
-                           "roots": roots_json}));
+                           "roots": roots_json});
+        // evidence of the order of work: what grep dropped was never hashed (hashed counts only what is listed)
+        if a.grep.is_some() || a.grep_re.is_some() {
+            v["grep_dropped"] = json!(grep_dropped);
+        }
+        if a.hash {
+            v["hashed"] = json!(hashed);
+            v["hash_failed"] = json!(hash_failed);
+            v["sha256_impl"] = json!(gorilla_size::sha256::implementation());
+        }
+        print_json(&v);
     } else if finding {
-        emit_found(&sorted_found(all_found, a), a, &mut out);
+        let mut sel = sorted_found(all_found, a);
+        if a.hash {
+            hash_failed += hash_found(&mut sel).1;
+        }
+        emit_found(&sel, a, &mut out);
         print!("{out}");
     } else {
         print!("{out}");
     }
-    if a.strict && any_errors { 3 } else { 0 }
+    if (a.strict && any_errors) || hash_failed > 0 { 3 } else { 0 }
 }
 
 fn root_json(rep: &walk::Report, abs: &Path, secs: f64, a: &Args) -> Value {
@@ -556,31 +597,47 @@ fn pick(a: &Args) -> Option<content::Pick> {
     }
 }
 
+/// The search inside one file that --grep or --grep-re asks for (None when neither was given).
+fn grep_file(p: &Path, a: &Args, max_hits: usize) -> Option<std::io::Result<content::Grep>> {
+    // one line in memory is never more than --max-bytes, whatever the file holds (content.rs)
+    if let Some(needle) = &a.grep {
+        Some(content::grep(p, needle, a.ignore_case, max_hits, 300, a.max_bytes))
+    } else {
+        a.grep_re.as_ref().map(|r| content::grep_re(p, &re(r, a.ignore_case), max_hits, 300, a.max_bytes))
+    }
+}
+
+/// "89 50 4e 47 ..." for a person, "89504e47..." for a program
+fn hex_spaced(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+}
+
 fn read_text(p: &Path, a: &Args) -> String {
     let mut s = String::new();
-    if content::is_binary(p).unwrap_or(false) {
-        s.push_str("    (binary file: not shown)\n");
-        return s;
-    }
-    if let Some(needle) = &a.grep {
-        match content::grep(p, needle, a.ignore_case, a.max_hits, 300) {
-            Ok(hits) => {
-                for (n, l) in hits {
-                    s.push_str(&format!("    {n:>6}: {l}\n"));
-                }
-            }
-            Err(e) => s.push_str(&format!("    (unreadable: {e})\n")),
+    match content::sniff(p) {
+        Ok(Some(b)) => {
+            s.push_str(&format!("    (binary file: not shown; {}, {}, first {} bytes {})\n", units::human(b.bytes),
+                                b.kind.unwrap_or("kind unknown"), b.head.len(), hex_spaced(&b.head)));
+            return s;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            s.push_str(&format!("    (unreadable: {e})\n"));
+            return s;
         }
     }
-    if let Some(r) = &a.grep_re {
-        match content::grep_re(p, &re(r, a.ignore_case), a.max_hits, 300) {
-            Ok(hits) => {
-                for (n, l) in hits {
-                    s.push_str(&format!("    {n:>6}: {l}\n"));
-                }
+    match grep_file(p, a, a.max_hits) {
+        Some(Ok(g)) => {
+            for (n, l) in g.hits {
+                s.push_str(&format!("    {n:>6}: {l}\n"));
             }
-            Err(e) => s.push_str(&format!("    (unreadable: {e})\n")),
+            if g.long_lines > 0 {
+                s.push_str(&format!("    ({} line(s) longer than --max-bytes: truncated at {} bytes, only that much \
+                                     of them searched)\n", g.long_lines, a.max_bytes));
+            }
         }
+        Some(Err(e)) => s.push_str(&format!("    (unreadable: {e})\n")),
+        None => {}
     }
     if let Some(pk) = pick(a) {
         match content::lines(p, &pk, a.max_bytes) {
@@ -589,7 +646,7 @@ fn read_text(p: &Path, a: &Args) -> String {
                     if n > 0 { s.push_str(&format!("    {n:>6}| {l}\n")); } else { s.push_str(&format!("          | {l}\n")); }
                 }
                 if cut {
-                    s.push_str(&format!("    (stopped at --max-bytes {})\n", a.max_bytes));
+                    s.push_str(&format!("    (truncated at {} bytes: --max-bytes)\n", a.max_bytes));
                 }
             }
             Err(e) => s.push_str(&format!("    (unreadable: {e})\n")),
@@ -599,30 +656,75 @@ fn read_text(p: &Path, a: &Args) -> String {
 }
 
 fn read_json(p: &Path, a: &Args) -> Value {
-    if content::is_binary(p).unwrap_or(false) {
-        return json!({"binary": true});
+    match content::sniff(p) {
+        Ok(Some(b)) => {
+            return json!({"binary": true, "bytes": b.bytes, "kind": b.kind,
+                          "first_bytes": gorilla_size::sha256::hex(&b.head)});
+        }
+        Ok(None) => {}
+        Err(e) => return json!({"error": e.to_string()}),
     }
     let mut v = json!({});
-    if let Some(needle) = &a.grep {
-        v["grep"] = match content::grep(p, needle, a.ignore_case, a.max_hits, 300) {
-            Ok(h) => Value::Array(h.into_iter().map(|(n, l)| json!({"line": n, "text": l})).collect()),
-            Err(e) => json!({"error": e.to_string()}),
-        };
-    }
-    if let Some(r) = &a.grep_re {
-        v["grep"] = match content::grep_re(p, &re(r, a.ignore_case), a.max_hits, 300) {
-            Ok(h) => Value::Array(h.into_iter().map(|(n, l)| json!({"line": n, "text": l})).collect()),
-            Err(e) => json!({"error": e.to_string()}),
-        };
+    match grep_file(p, a, a.max_hits) {
+        Some(Ok(g)) => {
+            v["grep"] = Value::Array(g.hits.into_iter().map(|(n, l)| json!({"line": n, "text": l})).collect());
+            if g.long_lines > 0 {
+                v["grep_long_lines"] = json!(g.long_lines);
+                v["truncated_at"] = json!(a.max_bytes);
+            }
+        }
+        Some(Err(e)) => v["grep"] = json!({"error": e.to_string()}),
+        None => {}
     }
     if let Some(pk) = pick(a) {
         v["lines"] = match content::lines(p, &pk, a.max_bytes) {
-            Ok((ls, cut)) => json!({"cut": cut, "lines": ls.into_iter().map(|(n, l)| json!({"line": n, "text": l}))
-                .collect::<Vec<_>>()}),
+            Ok((ls, cut)) => {
+                let mut l = json!({"cut": cut, "lines": ls.into_iter().map(|(n, l)| json!({"line": n, "text": l}))
+                    .collect::<Vec<_>>()});
+                if cut {
+                    l["truncated_at"] = json!(a.max_bytes);
+                }
+                l
+            }
             Err(e) => json!({"error": e.to_string()}),
         };
     }
     v
+}
+/// find --grep / --grep-re select: only text files with at least one matching line stay. Folders, links and
+/// binary files have no lines to match and are dropped too. Every core. Returns (kept, how many were dropped).
+fn grep_select(v: Vec<walk::Found>, a: &Args) -> (Vec<walk::Found>, usize) {
+    use rayon::prelude::*;
+    if a.grep.is_none() && a.grep_re.is_none() {
+        return (v, 0);
+    }
+    let before = v.len();
+    let kept: Vec<walk::Found> = v.into_par_iter().filter(|f| {
+        let p = Path::new(&f.path);
+        f.kind == walk::Kind::File && matches!(content::sniff(p), Ok(None))
+            && matches!(grep_file(p, a, 1), Some(Ok(g)) if !g.hits.is_empty())
+    }).collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
+}
+
+/// find --hash: SHA-256 of every file in `v` (already filtered, sorted and cut to -n), every core. Folders and
+/// links get none. Returns (hashed, failed); a file that could not be read keeps no hash and makes the exit 3.
+fn hash_found(v: &mut [walk::Found]) -> (usize, usize) {
+    use rayon::prelude::*;
+    let r: Vec<Option<bool>> = v.par_iter_mut().map(|f| {
+        if f.kind != walk::Kind::File {
+            return None;
+        }
+        match gorilla_size::sha256::file(Path::new(&f.path), None) {
+            Ok(d) => {
+                f.sha256 = Some(gorilla_size::sha256::hex(&d));
+                Some(true)
+            }
+            Err(_) => Some(false),
+        }
+    }).collect();
+    (r.iter().filter(|x| **x == Some(true)).count(), r.iter().filter(|x| **x == Some(false)).count())
 }
 
 fn sorted_found(mut v: Vec<walk::Found>, a: &Args) -> Vec<walk::Found> {

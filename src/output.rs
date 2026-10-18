@@ -177,7 +177,9 @@ fn kind_short(k: Kind) -> &'static str {
 
 pub fn found_text(v: &[Found], out: &mut String) {
     for f in v {
-        out.push_str(&format!("{:>10}  {}  {}  {}\n", human(f.bytes), kind_short(f.kind), date(f.mtime), f.path));
+        // find --hash: the digest goes before the path, so the path stays the last field of the line
+        let h = f.sha256.as_ref().map(|h| format!("{h}  ")).unwrap_or_default();
+        out.push_str(&format!("{:>10}  {}  {}  {h}{}\n", human(f.bytes), kind_short(f.kind), date(f.mtime), f.path));
     }
 }
 
