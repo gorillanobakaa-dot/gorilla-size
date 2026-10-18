@@ -341,6 +341,8 @@ fn dupes_empty_reparse_free_hash_from_the_command_line() {
     assert_eq!(e["empty_dirs"].as_array().unwrap().len(), 2);
     let h = json(&["hash", s(&t.0.join("a/x.bin"))]);
     assert_eq!(h[0]["sha256"].as_str().unwrap().len(), 64);
+    let imp = h[0]["sha256_impl"].as_str().unwrap();
+    assert!(imp == "sha-ni" || imp == "portable", "{h}");
     let f = json(&["free"]);
     assert!(!f.as_array().unwrap().is_empty());
     let r = json(&["reparse", s(&t.0)]);

@@ -29,7 +29,8 @@ MEASURE
 
 FIND AND READ
   gorilla-size find [FILTERS] [PATH ...]   every file/folder/link that matches, with its size
-  gorilla-size hash PATH ...               SHA-256 of files (folders: every file under them)
+  gorilla-size hash PATH ...               SHA-256 of files (folders: every file under them); the CPU's SHA
+                                           instructions when it has them (--json: sha256_impl sha-ni|portable)
   gorilla-size dupes [--min-size S] PATH ...   the same bytes in more than one place
   gorilla-size empty PATH                  empty folders and zero-byte files
   gorilla-size reparse PATH                every link: kind, target, broken or not
@@ -48,7 +49,7 @@ ACT (verified, journalled, undoable; never a permanent delete)
 MACHINE
   gorilla-size bench A B [--rounds N] -- ARGS   two programs, same ARGS, alternating; a verdict only when the
                                            middle halves of the runs do not overlap, else INCONCLUSIVE
-  gorilla-size profile                     this machine and the calibrated thread count per disk
+  gorilla-size profile                     this machine, its SHA-256 path, the calibrated thread count per disk
   gorilla-size profile --recalibrate [SAMPLE] [--rounds N]   measure 1..N threads on SAMPLE, keep the fastest
 
 REPORT OPTIONS
@@ -809,9 +810,12 @@ fn run_hash(a: &Args) -> u8 {
     }
     let v = extra::hash(&a.paths.iter().map(|p| absolute(p)).collect::<Vec<_>>());
     let bad = v.iter().filter(|x| x.1.is_err()).count();
+    // which block function produced the digests ("sha-ni" or "portable"): a speed claim names its code path.
+    // On every entry, so the output stays the array it always was.
+    let imp = gorilla_size::sha256::implementation();
     if a.json {
         print_json(&Value::Array(v.iter().map(|(p, h, b)| match h {
-            Ok(h) => json!({"path": p, "sha256": h, "bytes": b}),
+            Ok(h) => json!({"path": p, "sha256": h, "bytes": b, "sha256_impl": imp}),
             Err(e) => json!({"path": p, "error": e}),
         }).collect()));
     } else {
@@ -1084,6 +1088,8 @@ fn run_profile(a: &Args) -> u8 {
         println!("features {}", m["features"].as_array().map(|f| f.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>()
             .join(" ")).unwrap_or_default());
         println!("RAM      {} GiB", m["ram_gib"]);
+        println!("SHA-256  {} (hash, dupes, find --hash; chosen at run time)",
+                 v["sha256_impl"].as_str().unwrap_or("?"));
         println!("profile  {}{}", v["profile_file"].as_str().unwrap_or(""),
                  if v["saved_is_this_machine"] == true { "" } else { "  (none for this machine yet: profile --recalibrate)" });
         if let Some(vols) = v["saved"]["volumes"].as_object() {

@@ -320,7 +320,9 @@ pub fn calibrate(sample: &Path, rounds: usize, mut progress: impl FnMut(&str)) -
 pub fn show() -> Value {
     let m = machine();
     let saved = load();
-    json!({"machine": machine_json(&m), "profile_file": path().display().to_string(),
+    // sha256_impl: the SHA-256 block function hash/dupes/find --hash will use on this CPU (chosen at run time, sha256.rs)
+    json!({"machine": machine_json(&m), "sha256_impl": crate::sha256::implementation(),
+           "profile_file": path().display().to_string(),
            "saved": saved.clone().unwrap_or(Value::Null),
            "saved_is_this_machine": saved.as_ref().map(|v| same_machine(v, &m)).unwrap_or(false)})
 }

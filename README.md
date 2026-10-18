@@ -118,7 +118,8 @@ gorilla-size find [FILTERS] [OUTPUT] [READ] [PATH ...]
 - **Read in the same call:** `--head N`, `--tail N` (reads only the end, even of a 50 GiB log), `--lines A:B`,
   `--grep TEXT`, `--grep-re RE`, capped by `--max-bytes` (16 KiB per file) and `--max-hits` (20 per file). Binary
   files are recognized and never dumped.
-- **Also:** `hash PATH ...` (SHA-256), `dupes PATH ...` (size, then the first 64 KiB, then the full hash: unique
+- **Also:** `hash PATH ...` (SHA-256; on a CPU with the SHA extensions the hardware instructions are used, chosen
+  at run time, and `--json` names the path in `sha256_impl`: `sha-ni` or `portable`), `dupes PATH ...` (size, then the first 64 KiB, then the full hash: unique
   sizes are never read), `empty PATH`, `reparse PATH` (every link, its target, broken or not).
 
 ## 6. Act: copy, move, recycle, undo
@@ -157,8 +158,9 @@ find ... --copy-to DIR | --move-to DIR | --recycle                            go
 
 ## 7. The machine profile
 
-`gorilla-size profile` shows the processor (performance and efficiency cores, instruction sets), the memory and the
-disks it knows. `gorilla-size profile --recalibrate FOLDER` walks FOLDER with 1, 2, 4 ... every thread, alternating,
+`gorilla-size profile` shows the processor (performance and efficiency cores, instruction sets), the memory, the
+SHA-256 code path this CPU gets (`sha-ni` or `portable`) and the disks it knows. Measured 2026-10-18 on the laptop
+below, 256 MiB in memory: portable 143 MiB/s, SHA-NI 1,047 MiB/s (7.3x), same digests. `gorilla-size profile --recalibrate FOLDER` walks FOLDER with 1, 2, 4 ... every thread, alternating,
 several rounds, and keeps the fastest count for that disk in `%LOCALAPPDATA%\gorilla\machine.json`
 (`~/.local/state/gorilla/machine.json`). Every later run on that disk uses it. A different CPU makes it re-measure.
 
