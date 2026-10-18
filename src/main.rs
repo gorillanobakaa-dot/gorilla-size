@@ -23,7 +23,9 @@ MEASURE
   gorilla-size [OPTIONS] [PATH ...]        biggest first, as a tree (PATH defaults to .)
   gorilla-size types [PATH ...]            bytes and files by extension
   gorilla-size newest|oldest [PATH ...]    files by age (-n N)
-  gorilla-size watch PATH --every SECS     re-measure, print the growth (--count N to stop)
+  gorilla-size watch PATH --every SECS     re-measure, print the growth (--count N to stop); --alert-growth 1G:
+                                           ALERT and exit 3 when one interval grows more than that; honors
+                                           --exclude, --gitignore, --no-hidden like a measurement
   gorilla-size free                        every drive: kind, size, free
   gorilla-size compare OLD.json NEW.json   what grew, shrank, appeared or went
 
@@ -143,6 +145,7 @@ struct Args {
     recalibrate: bool,
     rounds: Option<usize>,
     bench_profile: bool,
+    alert_growth: Option<u64>,
 }
 
 const MODES: [&str; 20] = ["find", "compare", "types", "newest", "oldest", "watch", "free", "hash", "dupes", "empty",
@@ -252,6 +255,7 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--recalibrate" => a.recalibrate = true,
             "--rounds" => a.rounds = Some(num(val("--rounds")?, "--rounds")?.max(1)),
             "--profile" => a.bench_profile = true,
+            "--alert-growth" => a.alert_growth = Some(units::parse_size(&val("--alert-growth")?)?),
             x => return Err(format!("unknown option {x} (--help lists them)")),
         }
     }
@@ -945,19 +949,44 @@ fn run_watch(a: &Args) -> u8 {
     }
     let every = a.every.unwrap_or(60).max(1);
     let root = absolute(&a.paths[0]);
+    if std::fs::symlink_metadata(&root).is_err() {
+        return fail(a, 2, format!("{} does not exist", root.display()));
+    }
+    // The same skip rules as a measurement: 2026-10-18 audit found watch walked with totals_only(), so
+    // --exclude, --gitignore and --no-hidden were accepted and silently ignored, and the numbers disagreed with
+    // `gorilla-size PATH --exclude ...` on the same folder.
+    let walk_opts = || walk::Opts { gitignore: a.gitignore, exclude: a.exclude.clone(), hidden: !a.no_hidden,
+                                    ignore_case: a.ignore_case, one_filesystem: !a.cross,
+                                    ..walk::Opts::totals_only() };
     let mut last: Option<u64> = None;
     let mut n = 0u64;
     loop {
-        let r = walk::run(&root, walk::Opts::totals_only());
+        let r = walk::run(&root, walk_opts());
         let b = r.root.bytes;
         let delta = last.map(|l| b as i128 - l as i128);
+        // --alert-growth: only GROWTH between two consecutive measurements above the threshold; shrinking never
+        // alerts. The run stops at the first alert with exit 3, so a script (or a scheduled task at 3 a.m.) wakes up.
+        let alert = matches!((delta, a.alert_growth), (Some(d), Some(limit)) if d > limit as i128);
         let stamp = now();
         if a.json {
-            println!("{}", json!({"time": stamp, "bytes": b, "files": r.root.files, "delta": delta.map(|d| d as i64)}));
+            let mut j = json!({"time": stamp, "bytes": b, "files": r.root.files, "delta": delta.map(|d| d as i64),
+                               "excluded": r.excluded, "hidden_skipped": r.hidden_skipped});
+            if alert {
+                j["alert"] = json!(true);
+                j["alert_growth"] = json!(a.alert_growth);
+            }
+            println!("{j}");
         } else {
             let d = delta.map(|d| format!("  {}{}", if d >= 0 { "+" } else { "-" }, units::human(d.unsigned_abs() as u64)))
                 .unwrap_or_default();
             println!("{}  {:>10}  {} files{d}", output::date(Some(stamp)), units::human(b), units::count(r.root.files));
+            if alert {
+                println!("ALERT: {} grew by {} in {every} s, more than --alert-growth {}", root.display(),
+                         units::human(delta.unwrap_or(0) as u64), units::human(a.alert_growth.unwrap_or(0)));
+            }
+        }
+        if alert {
+            return 3;
         }
         last = Some(b);
         n += 1;

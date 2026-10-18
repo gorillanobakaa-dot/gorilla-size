@@ -104,6 +104,12 @@ gorilla-size newest|oldest [PATH ...]  gorilla-size watch PATH --every 60 gorill
 | `-j N` | threads (default: the calibrated count for that disk, otherwise every core) |
 | `--json`, `--ascii` | machine-readable; plain characters (automatic when piped) |
 
+**watch** measures the folder again every `--every` seconds (60) and prints the growth since the last time
+(`--count N` stops after N measurements). `--alert-growth 1G` prints an `ALERT` line (JSON: `"alert": true`) and
+stops with exit 3 the first time one interval grows by more than 1 GiB: a build filling the disk at 3 a.m. wakes the
+script that watches it. Shrinking never alerts. `--exclude`, `--gitignore` and `--no-hidden` apply exactly as in a
+measurement (before 0.3.0 they were accepted and ignored).
+
 ## 5. Find and read
 
 ```

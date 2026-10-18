@@ -106,3 +106,52 @@ fn bench_runs_ten_rounds_unless_told_otherwise() {
     assert_eq!(v["a_seconds"].as_array().unwrap().len(), 10);
     assert!(v["a_spread"]["max"].as_f64().unwrap() >= v["a_spread"]["min"].as_f64().unwrap());
 }
+/// watch with stdout read line by line: `grow` runs once, right after the first measurement is printed, so the
+/// growth always falls between measurement 1 and 2 (no sleep-based race with process start-up).
+fn watch_lines(args: &[&str], grow: impl FnOnce()) -> (i32, Vec<Value>) {
+    use std::io::BufRead;
+    let mut child = Command::new(BIN).args(args).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut out = vec![serde_json::from_str::<Value>(&lines.next().unwrap().unwrap()).unwrap()];
+    grow();
+    for l in lines {
+        out.push(serde_json::from_str(&l.unwrap()).unwrap());
+    }
+    (child.wait().unwrap().code().unwrap_or(-1), out)
+}
+
+#[test]
+fn watch_alerts_on_growth_over_the_threshold_and_stops_with_exit_3() {
+    let t = tmp("watchalert");
+    file(&t.0.join("seed.txt"), b"x");
+    let big = t.0.join("big.bin");
+    let (rc, v) = watch_lines(&["watch", s(&t.0), "--every", "1", "--count", "3", "--alert-growth", "1M", "--json"],
+                              || file(&big, &vec![0u8; 2 << 20]));
+    assert_eq!(rc, 3, "{v:?}");
+    assert_eq!(v.len(), 2, "stops at the first alert: {v:?}");
+    assert!(v[0].get("alert").is_none(), "{}", v[0]);
+    assert_eq!(v[1]["alert"], true, "{}", v[1]);
+    assert!(v[1]["delta"].as_i64().unwrap() >= 2 << 20, "{}", v[1]);
+    // under the threshold: no alert, runs to --count, exit 0
+    let (rc, v) = watch_lines(&["watch", s(&t.0), "--every", "1", "--count", "2", "--alert-growth", "1G", "--json"],
+                              || file(&t.0.join("more.bin"), &vec![0u8; 4096]));
+    assert_eq!(rc, 0, "{v:?}");
+    assert!(v.iter().all(|x| x.get("alert").is_none()), "{v:?}");
+    let (_, text, _) = run(&["watch", s(&t.0), "--count", "1"]);
+    assert!(!text.contains("ALERT"), "{text}");
+}
+
+#[test]
+fn watch_honors_exclude_like_a_measurement() {
+    // 2026-10-18 audit: watch measured with totals_only() and ignored --exclude/--gitignore/--no-hidden
+    let t = tmp("watchex");
+    file(&t.0.join("keep.txt"), b"12345");
+    let (rc, v) = watch_lines(&["watch", s(&t.0), "--every", "1", "--count", "2", "--alert-growth", "1M",
+                                "--exclude", "*.bin", "--json"],
+                              || file(&t.0.join("excluded.bin"), &vec![0u8; 2 << 20]));
+    assert_eq!(rc, 0, "growth only in excluded files is no growth: {v:?}");
+    assert_eq!(v[0]["bytes"], 5);
+    assert_eq!(v[1]["bytes"], 5, "{}", v[1]);
+    assert_eq!(v[1]["excluded"], 1, "{}", v[1]);
+    assert_eq!(v[1]["delta"], 0);
+}
