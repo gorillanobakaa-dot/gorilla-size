@@ -17,7 +17,10 @@ Compiled into the binary (`cargo tree -e normal`):
 Present in `vendor/` but not compiled in (cargo resolves them for optional features): serde, serde_derive,
 proc-macro2, quote, syn, unicode-ident.
 
-Written here instead of imported: SHA-256 (`src/sha256.rs`, checked against the NIST vectors), gitignore matching
+Written here instead of imported: SHA-256 (`src/sha256.rs`, checked against the NIST vectors; the SHA-NI path
+uses `std::arch` intrinsics chosen at run time, so no `sha2`/`cpufeatures` crate), gitignore matching
 (`src/ignore.rs`), globs (`src/glob.rs`), the Recycle Bin and freedesktop trash code (`src/actions.rs`), the NTFS
-master file table reader (`src/mft.rs`), all Windows API declarations (`src/os.rs`, `src/fastdir.rs`,
-`src/profile.rs`).
+master file table reader (`src/mft.rs`), the `/etc/passwd` reader for `--long` owners (`src/os.rs`, no libc
+crate), all Windows API declarations (`src/os.rs`, `src/fastdir.rs`, `src/profile.rs`).
+
+0.3.0 added no crate. BLAKE3 (plan item 13) would need one and waits for the owner's decision.
