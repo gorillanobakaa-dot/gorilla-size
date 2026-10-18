@@ -39,7 +39,8 @@ FIND AND READ
   gorilla-size reparse PATH                every link: kind, target, broken or not
 
 ACT (verified, journalled, undoable; never a permanent delete)
-  gorilla-size copy SRC ... --to DIR       every byte compared after the copy
+  gorilla-size copy SRC ... --to DIR       every byte compared after the copy; an existing target is refused,
+                                           or with --overwrite moved aside first (<name>.gorilla-bak-<time>)
   gorilla-size move SRC ... --to DIR       same drive: rename; other drive: verified copy + recycle
   gorilla-size recycle PATH ...            to the Recycle Bin / trash; refused when Windows would destroy instead;
                                            verified in the bin's own records
@@ -1360,6 +1361,26 @@ mod tests {
 
     fn p(s: &str) -> Result<Args, String> {
         parse(s.split_whitespace().map(String::from).collect())
+    }
+
+    /// Every long option the parser accepts is named in --help (2026-10-18: --overwrite worked but was in no help
+    /// text, so Fieldkit's card check, which holds each card to the program's help, could not see it). Read from this
+    /// file's own source: each `"--x" =>` match arm in parse().
+    #[test]
+    fn every_option_the_parser_takes_is_in_the_help() {
+        let src = include_str!("main.rs");
+        let body = &src[src.find("fn parse(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let mut missing = Vec::new();
+        for line in body.lines() {
+            for part in line.split("=>").next().unwrap_or("").split('|') {
+                let t = part.trim().trim_matches('"');
+                if t.starts_with("--") && t.len() > 2 && !["--help", "--version"].contains(&t) && !HELP.contains(t) {
+                    missing.push(t.to_string());
+                }
+            }
+        }
+        assert!(missing.is_empty(), "options missing from --help: {missing:?}");
     }
 
     #[test]
