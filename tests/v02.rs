@@ -334,10 +334,13 @@ fn dupes_empty_reparse_free_hash_from_the_command_line() {
     file(&t.0.join("a/x.bin"), &vec![5u8; 2048]);
     file(&t.0.join("b/y.bin"), &vec![5u8; 2048]);
     fs::create_dir_all(t.0.join("void/deeper")).unwrap();
-    let d = json(&["dupes", s(&t.0)]);
+    // 0.3.0: dupes and empty exit 3 when they find something (plan exit contract); was 0
+    let (rc, d) = json_any(&["dupes", s(&t.0)]);
+    assert_eq!(rc, 3, "{d}");
     assert_eq!(d["groups"].as_array().unwrap().len(), 1);
     assert_eq!(d["wasted_bytes"], 2048);
-    let e = json(&["empty", s(&t.0)]);
+    let (rc, e) = json_any(&["empty", s(&t.0)]);
+    assert_eq!(rc, 3, "{e}");
     assert_eq!(e["empty_dirs"].as_array().unwrap().len(), 2);
     let h = json(&["hash", s(&t.0.join("a/x.bin"))]);
     assert_eq!(h[0]["sha256"].as_str().unwrap().len(), 64);

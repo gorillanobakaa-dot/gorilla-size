@@ -87,7 +87,9 @@ LARGE OPERATIONS
   (exit 4); review it, then `gorilla-size apply PLAN`. --plan always writes the plan. copy is never held.
 
 SIZES 500M 2G 1.5T (binary)   AGES 90s 30m 12h 7d 2w 1y
-EXIT 0 done, 2 bad usage, 3 something failed or was unreadable (--strict), 4 held for a plan
+EXIT 0 done (nothing found), 2 bad usage, 3 found (dupes: duplicates, empty: empties, reparse: a broken link,
+     watch: --alert-growth) or something failed or was unreadable (--strict), 4 held for a plan.
+     With --json an error is {\"error\": \"...\", \"exit\": N} on stdout.
 ";
 
 #[derive(Default)]
@@ -299,6 +301,8 @@ fn main() -> ExitCode {
             argv.pop();
         }
     }
+    // a usage error comes before Args exist: --json anywhere on the line still gets its answer as JSON
+    let wants_json = argv.iter().any(|x| x == "--json");
     let a = match parse(argv) {
         Ok(a) => a,
         Err(e) if e == "HELP" => {
@@ -309,10 +313,7 @@ fn main() -> ExitCode {
             println!("gorilla-size {VERSION}");
             return ExitCode::SUCCESS;
         }
-        Err(e) => {
-            eprintln!("gorilla-size: {e}");
-            return ExitCode::from(2);
-        }
+        Err(e) => return ExitCode::from(fail_as(wants_json, 2, &format!("gorilla-size: {e}"))),
     };
     let first = a.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
     let threads = a.threads.or_else(|| profile::threads_for(&absolute(&first)));
@@ -341,10 +342,15 @@ fn main() -> ExitCode {
 
 fn need_paths(a: &Args, what: &str) -> Option<u8> {
     if a.paths.is_empty() {
-        eprintln!("gorilla-size {}: {what}", a.mode);
-        return Some(2);
+        return Some(fail(a, 2, what));
     }
     None
+}
+
+/// The first PATH that does not exist, as an error (exit 2): a mistyped path must not look like a clean result.
+fn missing(a: &Args) -> Option<u8> {
+    a.paths.iter().map(|p| absolute(p)).find(|p| std::fs::symlink_metadata(p).is_err())
+        .map(|p| fail(a, 2, format!("{} does not exist", p.display())))
 }
 
 fn print_json(v: &Value) {
@@ -424,17 +430,13 @@ fn run_measure(a: &Args, threads_from: &str) -> u8 {
     for p in &paths {
         let abs = absolute(p);
         if std::fs::symlink_metadata(&abs).is_err() {
-            eprintln!("gorilla-size: {} does not exist", abs.display());
-            return 2;
+            return fail(a, 2, format!("{} does not exist", abs.display()));
         }
         let t0 = Instant::now();
         let rep = if a.mft {
             match mft::run(&abs, a.depth.max(1), a.files) {
                 Ok(r) => r,
-                Err(e) => {
-                    eprintln!("gorilla-size --mft: {e}");
-                    return 2;
-                }
+                Err(e) => return fail(a, 2, format!("--mft: {e}")),
             }
         } else {
             walk::run(&abs, opts(a, finding))
@@ -764,8 +766,7 @@ fn run_act_paths(a: &Args) -> u8 {
         return c;
     }
     if a.mode != "recycle" && a.to.is_none() {
-        eprintln!("gorilla-size {}: --to DIR is needed", a.mode);
-        return 2;
+        return fail(a, 2, "--to DIR is needed");
     }
     let items: Vec<PathBuf> = outermost(a.paths.iter().map(|p| absolute(p)).collect());
     act(&a.mode.clone(), &items, a.to.as_deref(), a)
@@ -778,8 +779,7 @@ fn act(op: &str, items: &[PathBuf], to: Option<&Path>, a: &Args) -> u8 {
     }
     if let Some(t) = to {
         if !t.is_dir() {
-            eprintln!("gorilla-size: {} is not a folder", t.display());
-            return 2;
+            return fail(a, 2, format!("{} is not a folder", t.display()));
         }
     }
     let (mut files, mut bytes) = (0u64, 0u64);
@@ -809,8 +809,7 @@ fn write_plan(op: &str, items: &[PathBuf], to: Option<&Path>, files: u64, bytes:
         }
     }
     if path.as_os_str().is_empty() {
-        eprintln!("gorilla-size: no free plan name");
-        return 3;
+        return fail(a, 3, "no free plan name");
     }
     let v = json!({"tool": "gorilla-size", "plan": op, "to": to.map(|t| t.display().to_string()),
                    "overwrite": a.overwrite, "files": files, "bytes": bytes,
@@ -821,8 +820,7 @@ fn write_plan(op: &str, items: &[PathBuf], to: Option<&Path>, files: u64, bytes:
                        json!({"path": p.display().to_string(), "files": n, "bytes": b, "mtime": m})
                    }).collect::<Vec<_>>()});
     if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()) {
-        eprintln!("gorilla-size: could not write the plan: {e}");
-        return 3;
+        return fail(a, 3, format!("could not write the plan: {e}"));
     }
     let why = if big { format!("{} files / {} is over the threshold ({} files / {})", units::count(files),
                                units::human(bytes), units::count(a.plan_files), units::human(a.plan_bytes)) }
@@ -841,8 +839,7 @@ fn execute(op: &str, items: &[PathBuf], to: Option<&Path>, a: &Args) -> u8 {
     let mut j = match actions::Journal::open(op) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("gorilla-size: no journal, nothing done: {e}");
-            return 3;
+            return fail(a, 3, format!("no journal, nothing done: {e}"));
         }
     };
     let mut done = Vec::new();
@@ -892,22 +889,19 @@ fn run_apply(a: &Args) -> u8 {
     let text = match std::fs::read_to_string(&a.paths[0]) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("gorilla-size apply: {e}");
-            return 2;
+            return fail(a, 2, e);
         }
     };
     // a plan reviewed and saved in Notepad or PowerShell 5.1 can start with a UTF-8 byte-order mark
     let v: Value = match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("gorilla-size apply: not a plan: {e}");
-            return 2;
+            return fail(a, 2, format!("not a plan: {e}"));
         }
     };
     let op = v["plan"].as_str().unwrap_or("").to_string();
     if !["copy", "move", "recycle"].contains(&op.as_str()) {
-        eprintln!("gorilla-size apply: unknown plan operation {op:?}");
-        return 2;
+        return fail(a, 2, format!("unknown plan operation {op:?}"));
     }
     let to = v["to"].as_str().map(PathBuf::from);
     let mut items = Vec::new();
@@ -935,7 +929,7 @@ fn run_apply(a: &Args) -> u8 {
 // ------------------------------------------------------------------------------------------------- read-only
 
 fn run_hash(a: &Args) -> u8 {
-    if let Some(c) = need_paths(a, "give files or folders") {
+    if let Some(c) = need_paths(a, "give files or folders").or_else(|| missing(a)) {
         return c;
     }
     let v = extra::hash(&a.paths.iter().map(|p| absolute(p)).collect::<Vec<_>>());
@@ -960,7 +954,7 @@ fn run_hash(a: &Args) -> u8 {
 }
 
 fn run_dupes(a: &Args) -> u8 {
-    if let Some(c) = need_paths(a, "give folders to search") {
+    if let Some(c) = need_paths(a, "give folders to search").or_else(|| missing(a)) {
         return c;
     }
     let g = extra::dupes(&a.paths.iter().map(|p| absolute(p)).collect::<Vec<_>>(), a.min.unwrap_or(1));
@@ -978,11 +972,25 @@ fn run_dupes(a: &Args) -> u8 {
         }
         println!("{} group(s), {} could be freed by keeping one copy of each", g.len(), units::human(wasted));
     }
-    0
+    // exit contract (plan section 1): 3 = something was found, so a script can branch without parsing
+    if g.is_empty() { 0 } else { 3 }
+}
+
+/// The root of empty/reparse (default: here); None (and the error said) when it does not exist. 2026-10-18: a
+/// mistyped path printed "0 empty folder(s)" and exit 0, the same as a clean folder.
+fn existing_root(a: &Args) -> Result<PathBuf, u8> {
+    let root = absolute(a.paths.first().map(|p| p.as_path()).unwrap_or(Path::new(".")));
+    if std::fs::symlink_metadata(&root).is_err() {
+        return Err(fail(a, 2, format!("{} does not exist", root.display())));
+    }
+    Ok(root)
 }
 
 fn run_empty(a: &Args) -> u8 {
-    let root = absolute(a.paths.first().map(|p| p.as_path()).unwrap_or(Path::new(".")));
+    let root = match existing_root(a) {
+        Ok(r) => r,
+        Err(c) => return c,
+    };
     let (dirs, files) = extra::empty(&root);
     if a.json {
         print_json(&json!({"empty_dirs": dirs, "zero_byte_files": files}));
@@ -995,11 +1003,14 @@ fn run_empty(a: &Args) -> u8 {
         }
         println!("{} empty folder(s), {} zero-byte file(s)", dirs.len(), files.len());
     }
-    0
+    if dirs.is_empty() && files.is_empty() { 0 } else { 3 }
 }
 
 fn run_reparse(a: &Args) -> u8 {
-    let root = absolute(a.paths.first().map(|p| p.as_path()).unwrap_or(Path::new(".")));
+    let root = match existing_root(a) {
+        Ok(r) => r,
+        Err(c) => return c,
+    };
     let v = extra::reparse(&root);
     if a.json {
         print_json(&Value::Array(v.iter().map(|(p, k, t, ok)| json!({"path": p, "kind": k, "target": t,
@@ -1010,7 +1021,8 @@ fn run_reparse(a: &Args) -> u8 {
         }
         println!("{} link(s), {} broken", v.len(), v.iter().filter(|x| !x.3).count());
     }
-    0
+    // links that work are not a finding; a broken one is
+    if v.iter().any(|x| !x.3) { 3 } else { 0 }
 }
 
 fn run_free(a: &Args) -> u8 {
@@ -1029,8 +1041,7 @@ fn run_free(a: &Args) -> u8 {
 
 fn run_compare(a: &Args) -> u8 {
     if a.paths.len() != 2 {
-        eprintln!("gorilla-size compare: give two reports, OLD.json NEW.json");
-        return 2;
+        return fail(a, 2, "give two reports, OLD.json NEW.json");
     }
     let (old, new) = (a.paths[0].to_string_lossy(), a.paths[1].to_string_lossy());
     if a.tree {
@@ -1058,10 +1069,7 @@ fn run_compare(a: &Args) -> u8 {
             }
             0
         }
-        Err(e) => {
-            eprintln!("gorilla-size compare: {e}");
-            2
-        }
+        Err(e) => fail(a, 2, e),
     }
 }
 
@@ -1150,8 +1158,7 @@ fn run_trash(a: &Args) -> u8 {
         "restore" => {
             let wanted: Vec<String> = a.paths[1..].iter().map(|p| p.to_string_lossy().into_owned()).collect();
             if wanted.is_empty() {
-                eprintln!("gorilla-size trash restore: give the original path (or the name) of what to put back");
-                return 2;
+                return fail(a, 2, "restore: give the original path (or the name) of what to put back");
             }
             let done = actions::bin_restore(&wanted);
             let failed = done.iter().filter(|d| !d.ok).count();
@@ -1166,8 +1173,7 @@ fn run_trash(a: &Args) -> u8 {
             if failed > 0 { 3 } else { 0 }
         }
         x => {
-            eprintln!("gorilla-size trash: {x}? use list or restore");
-            2
+            fail(a, 2, format!("{x}? use list or restore"))
         }
     }
 }

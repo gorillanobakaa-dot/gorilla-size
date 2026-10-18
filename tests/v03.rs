@@ -327,3 +327,54 @@ fn find_hashes_only_what_grep_kept() {
     let (_, out, _) = run(&["find", s(&t.0), "--name", "b.log", "--hash", "--format", "{sha256}  {name}"]);
     assert_eq!(out.trim_end(), format!("{sha}  b.log"));
 }
+#[test]
+fn dupes_empty_reparse_exit_3_when_they_find_something_and_0_when_clean() {
+    let t = tmp("exit3");
+    let clean = t.0.join("clean");
+    file(&clean.join("a.txt"), b"one");
+    file(&clean.join("b.txt"), b"two");
+    for mode in ["dupes", "empty", "reparse"] {
+        let (rc, v) = json_rc(&[mode, s(&clean)]);
+        assert_eq!(rc, 0, "{mode} on a clean folder: {v}");
+    }
+    let dirty = t.0.join("dirty");
+    file(&dirty.join("a.bin"), &[7u8; 100]);
+    file(&dirty.join("copy/a.bin"), &[7u8; 100]);
+    file(&dirty.join("zero.txt"), b"");
+    let (rc, _) = json_rc(&["dupes", s(&dirty)]);
+    assert_eq!(rc, 3);
+    let (rc, _) = json_rc(&["empty", s(&dirty)]);
+    assert_eq!(rc, 3);
+    // a link whose target is gone is a finding; a working link is not
+    let target = dirty.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let link = dirty.join("link");
+    #[cfg(windows)]
+    let made = Command::new("cmd").args(["/C", "mklink", "/J", s(&link), s(&target)]).output()
+        .map(|o| o.status.success()).unwrap_or(false);
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&target, &link).is_ok();
+    assert!(made, "could not make the link for the test");
+    let (rc, v) = json_rc(&["reparse", s(&dirty)]);
+    assert_eq!(rc, 0, "a working link: {v}");
+    fs::remove_dir(&target).unwrap();
+    let (rc, v) = json_rc(&["reparse", s(&dirty)]);
+    assert_eq!(rc, 3, "a broken link: {v}");
+    assert_eq!(v[0]["target_exists"], false);
+}
+
+#[test]
+fn under_json_an_error_is_json_on_stdout() {
+    let gone = std::env::temp_dir().join("gorilla-size-v03-no-such-folder-anywhere");
+    for args in [vec!["find", s(&gone)], vec![s(&gone)], vec!["empty", s(&gone)], vec!["dupes", s(&gone)],
+                 vec!["hash", s(&gone)], vec!["--nonsense"], vec!["compare", "only-one.json"]] {
+        let (rc, v) = json_rc(&args);
+        assert_eq!(rc, 2, "{args:?}: {v}");
+        assert_eq!(v["exit"], 2, "{args:?}: {v}");
+        assert!(!v["error"].as_str().unwrap().is_empty(), "{args:?}: {v}");
+    }
+    // without --json: a sentence on stderr, nothing on stdout
+    let (rc, out, err) = run(&["find", s(&gone)]);
+    assert_eq!((rc, out.as_str()), (2, ""));
+    assert!(err.contains("does not exist"), "{err}");
+}

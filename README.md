@@ -236,8 +236,13 @@ entry per PATH with `totals` (`bytes`, `disk_bytes`, `files`, `dirs`, `links_not
 `top_files`, `types`, `links`, `errors`, `other_filesystems`, and for `find`, `found`. Actions print `journal`, `ok`,
 `failed` and `actions`; a held operation prints `held`, `why` and `plan`.
 
-Exit codes: 0 done, 2 bad usage or missing path, 3 something failed (or `--strict` with unreadable entries),
-4 held for a plan.
+Exit codes: 0 done and nothing found, 2 bad usage or missing path, 3 something was found or failed, 4 held for a
+plan. "Found" (since 0.3.0): `dupes` found duplicates, `empty` found empty folders or zero-byte files, `reparse`
+found a broken link, `watch --alert-growth` saw the growth; a script can branch on the exit code without reading
+the output. "Failed": an action, a hash, or `--strict` with unreadable entries.
+
+Errors: with `--json`, an error is one JSON object on standard output, `{"error": "...", "exit": N}`, so a program
+reading the output always gets JSON; without `--json` it is one line on standard error.
 
 ## 11. Security: doors open and closed
 
