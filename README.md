@@ -110,6 +110,19 @@ stops with exit 3 the first time one interval grows by more than 1 GiB: a build 
 script that watches it. Shrinking never alerts. `--exclude`, `--gitignore` and `--no-hidden` apply exactly as in a
 measurement (before 0.3.0 they were accepted and ignored).
 
+**compare** reads two `--json` reports of the same place and lists what grew, shrank, appeared or went, biggest
+change first. `--tree` shows the same changes in the shape of the folders, each under the folder that holds it
+(only what changed and the folders on the way to it; `-n` changes per folder, default 30); with `--json` it is a
+nested tree (`roots`, each entry `name`, `before`, `after`, `delta`, `change`, `children`).
+
+```
++  6.35 KiB  grew    D:\build\tree
++  6.84 KiB  grew    |-- big
++  6.84 KiB  new     |   `-- new.bin
+-     500 B  shrank  `-- small
+-     500 B  gone        `-- d.txt
+```
+
 ## 5. Find and read
 
 ```

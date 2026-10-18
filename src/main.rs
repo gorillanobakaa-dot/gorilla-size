@@ -27,7 +27,8 @@ MEASURE
                                            ALERT and exit 3 when one interval grows more than that; honors
                                            --exclude, --gitignore, --no-hidden like a measurement
   gorilla-size free                        every drive: kind, size, free
-  gorilla-size compare OLD.json NEW.json   what grew, shrank, appeared or went
+  gorilla-size compare OLD.json NEW.json   what grew, shrank, appeared or went (--tree: in the shape of the
+                                           folders, honoring --ascii; with --json a nested tree)
 
 FIND AND READ
   gorilla-size find [FILTERS] [PATH ...]   every file/folder/link that matches, with its size
@@ -146,6 +147,7 @@ struct Args {
     rounds: Option<usize>,
     bench_profile: bool,
     alert_growth: Option<u64>,
+    tree: bool,
 }
 
 const MODES: [&str; 20] = ["find", "compare", "types", "newest", "oldest", "watch", "free", "hash", "dupes", "empty",
@@ -255,6 +257,7 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--recalibrate" => a.recalibrate = true,
             "--rounds" => a.rounds = Some(num(val("--rounds")?, "--rounds")?.max(1)),
             "--profile" => a.bench_profile = true,
+            "--tree" => a.tree = true,
             "--alert-growth" => a.alert_growth = Some(units::parse_size(&val("--alert-growth")?)?),
             x => return Err(format!("unknown option {x} (--help lists them)")),
         }
@@ -927,7 +930,24 @@ fn run_compare(a: &Args) -> u8 {
         eprintln!("gorilla-size compare: give two reports, OLD.json NEW.json");
         return 2;
     }
-    match compare::diff(&a.paths[0].to_string_lossy(), &a.paths[1].to_string_lossy()) {
+    let (old, new) = (a.paths[0].to_string_lossy(), a.paths[1].to_string_lossy());
+    if a.tree {
+        use std::io::IsTerminal;
+        return match compare::tree_diff(&old, &new) {
+            Ok(t) if a.json => {
+                print_json(&compare::tree_json(&t));
+                0
+            }
+            Ok(t) => {
+                // the same rule as the measurement tree: line-drawing characters only on a terminal
+                let ascii = a.ascii || !std::io::stdout().is_terminal();
+                print!("{}", compare::tree_text(&t, a.number.unwrap_or(30), ascii));
+                0
+            }
+            Err(e) => fail(a, 2, e),
+        };
+    }
+    match compare::diff(&old, &new) {
         Ok(v) => {
             if a.json {
                 print_json(&compare::json(&v));

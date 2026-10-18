@@ -155,3 +155,43 @@ fn watch_honors_exclude_like_a_measurement() {
     assert_eq!(v[1]["excluded"], 1, "{}", v[1]);
     assert_eq!(v[1]["delta"], 0);
 }
+#[test]
+fn compare_tree_shows_each_change_under_its_folder_text_and_nested_json() {
+    let t = tmp("cmptree");
+    let tree = t.0.join("tree");
+    file(&tree.join("a.bin"), &vec![1u8; 1000]);
+    file(&tree.join("big/b.patch"), &vec![1u8; 2000]);
+    file(&tree.join("small/d.txt"), &vec![1u8; 500]);
+    let (before, after) = (t.0.join("before.json"), t.0.join("after.json"));
+    let (_, out, _) = run(&[s(&tree), "-d", "3", "--json"]);
+    fs::write(&before, out).unwrap();
+    file(&tree.join("big/new.bin"), &vec![1u8; 7000]);
+    fs::remove_file(tree.join("small/d.txt")).unwrap();
+    let (_, out, _) = run(&[s(&tree), "-d", "3", "--json"]);
+    fs::write(&after, out).unwrap();
+
+    let (rc, text, err) = run(&["compare", s(&before), s(&after), "--tree", "--ascii"]);
+    assert_eq!(rc, 0, "{err}");
+    assert!(text.is_ascii(), "{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    let at = |needle: &str| lines.iter().position(|l| l.ends_with(needle)).unwrap_or_else(|| panic!("{needle}:\n{text}"));
+    let (root, big, new, small, gone) = (at("tree"), at("-- big"), at("-- new.bin"), at("-- small"), at("-- d.txt"));
+    assert!(lines[root].contains("grew"), "{text}");
+    assert!(lines[big].contains("grew") && lines[new].contains("new") && lines[gone].contains("gone"), "{text}");
+    assert!(root < big && big < new && new < small && small < gone, "children under their folder:\n{text}");
+    // one level deeper than its folder: the folder's branch plus one more indent
+    assert!(lines[new].find("new.bin").unwrap() > lines[big].find("big").unwrap(), "{text}");
+    assert!(!text.contains("a.bin") && !text.contains("b.patch"), "unchanged entries are not shown:\n{text}");
+
+    let (rc, v) = json_rc(&["compare", s(&before), s(&after), "--tree"]);
+    assert_eq!(rc, 0, "{v}");
+    let r = &v["roots"][0];
+    assert_eq!(r["delta"], 6500);
+    let kid = |n: &Value, name: &str| n["children"].as_array().unwrap().iter().find(|c| c["name"] == name).cloned()
+        .unwrap_or_else(|| panic!("{name} in {n}"));
+    let big = kid(r, "big");
+    assert_eq!(big["change"], "grew");
+    let nb = kid(&big, "new.bin");
+    assert_eq!((nb["change"].as_str(), nb["before"].is_null(), nb["after"].as_u64()), (Some("new"), true, Some(7000)));
+    assert_eq!(kid(&kid(r, "small"), "d.txt")["change"], "gone");
+}
