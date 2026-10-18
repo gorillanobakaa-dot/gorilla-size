@@ -181,13 +181,46 @@ pub fn found_text(v: &[Found], out: &mut String) {
     }
 }
 
-/// `--format`: {path} {name} {bytes} {size} {kind} {mtime} {date}, \t and \n escapes.
+/// `--format`: {path} {name} {bytes} {size} {kind} {mtime} {date} {sha256}, \t and \n escapes.
+///
+/// One pass over the TEMPLATE: each placeholder is replaced by its value and the value is never looked at again.
+/// 2026-10-18: the old chain of `.replace()` calls substituted inside values already inserted, so a file literally
+/// named `{bytes}.txt` printed as `5.txt` under `--format {name}`, and a path holding `{size}` changed. An unknown
+/// `{word}` and a lone brace are kept as they are.
 pub fn format_found(fmt: &str, f: &Found) -> String {
-    let name = std::path::Path::new(&f.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    fmt.replace("\\t", "\t").replace("\\n", "\n")
-        .replace("{path}", &f.path).replace("{name}", &name).replace("{bytes}", &f.bytes.to_string())
-        .replace("{size}", &human(f.bytes)).replace("{kind}", kind_name(f.kind))
-        .replace("{mtime}", &f.mtime.map(|t| t.to_string()).unwrap_or_default()).replace("{date}", &date(f.mtime))
+    let name = || std::path::Path::new(&f.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut out = String::with_capacity(fmt.len() + f.path.len());
+    let mut rest = fmt;
+    while let Some(c) = rest.chars().next() {
+        if c == '\\' && (rest.starts_with("\\t") || rest.starts_with("\\n")) {
+            out.push(if rest.as_bytes()[1] == b't' { '\t' } else { '\n' });
+            rest = &rest[2..];
+            continue;
+        }
+        if c == '{' {
+            if let Some(end) = rest.find('}') {
+                let value = match &rest[1..end] {
+                    "path" => Some(f.path.clone()),
+                    "name" => Some(name()),
+                    "bytes" => Some(f.bytes.to_string()),
+                    "size" => Some(human(f.bytes)),
+                    "kind" => Some(kind_name(f.kind).to_string()),
+                    "mtime" => Some(f.mtime.map(|t| t.to_string()).unwrap_or_default()),
+                    "date" => Some(date(f.mtime)),
+                    "sha256" => Some(f.sha256.clone().unwrap_or_default()),
+                    _ => None,
+                };
+                if let Some(v) = value {
+                    out.push_str(&v);
+                    rest = &rest[end + 1..];
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 /// seconds since 1970 -> "2026-10-16" (UTC); "-" when unknown
@@ -232,7 +265,11 @@ pub fn skipped_json(v: &[Skipped]) -> Value {
 }
 
 pub fn found_one(f: &Found) -> Value {
-    json!({"path": f.path, "kind": kind_name(f.kind), "bytes": f.bytes, "mtime": f.mtime})
+    let mut v = json!({"path": f.path, "kind": kind_name(f.kind), "bytes": f.bytes, "mtime": f.mtime});
+    if let Some(h) = &f.sha256 {
+        v["sha256"] = json!(h);
+    }
+    v
 }
 
 pub fn found_json(v: &[Found]) -> Value {
@@ -270,7 +307,18 @@ mod tests {
 
     #[test]
     fn format_fields() {
-        let f = Found { path: "C:/x/a.log".into(), kind: Kind::File, bytes: 2048, mtime: Some(0) };
+        let f = Found { path: "C:/x/a.log".into(), kind: Kind::File, bytes: 2048, mtime: Some(0), sha256: None };
         assert_eq!(format_found("{name}\\t{bytes}\\t{size}\\t{date}", &f), "a.log\t2048\t2.00 KiB\t1970-01-01");
+    }
+
+    #[test]
+    fn format_never_substitutes_inside_inserted_values() {
+        // (no backslash in the name: on Windows it is a path separator)
+        let f = Found { path: "C:/x/{bytes}{size}{path}.txt".into(), kind: Kind::File, bytes: 5, mtime: None,
+                        sha256: Some("ab".into()) };
+        assert_eq!(format_found("{name}|{bytes}", &f), "{bytes}{size}{path}.txt|5");
+        assert_eq!(format_found("{bytes}\\t{bytes}\\n", &f), "5\t5\n");
+        assert_eq!(format_found("{unknown} { {sha256}}", &f), "{unknown} { ab}");
+        assert_eq!(format_found("ünï{kind}\\x", &f), "ünïfile\\x");
     }
 }

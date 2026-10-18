@@ -120,6 +120,8 @@ pub struct Found {
     pub kind: Kind,
     pub bytes: u64,
     pub mtime: Option<u64>,
+    /// find --hash: filled after every filter (grep included) has run, never during the walk
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -366,7 +368,7 @@ fn walk(dir: &Path, rel: String, name: String, mtime: Option<u64>, depth: usize,
                 if let Some(f) = filter {
                     if f.wants(&e.name, Kind::Link, 0, e.mtime) {
                         bag.found.push(Found { path: path.display().to_string(), kind: Kind::Link, bytes: 0,
-                                               mtime: e.mtime });
+                                               mtime: e.mtime, sha256: None });
                     }
                 }
                 if keep {
@@ -411,7 +413,7 @@ fn walk(dir: &Path, rel: String, name: String, mtime: Option<u64>, depth: usize,
                 if let Some(f) = filter {
                     if f.wants(&e.name, Kind::File, bytes, e.mtime) {
                         bag.found.push(Found { path: path.display().to_string(), kind: Kind::File, bytes,
-                                               mtime: e.mtime });
+                                               mtime: e.mtime, sha256: None });
                     }
                 }
                 if keep {
@@ -425,7 +427,8 @@ fn walk(dir: &Path, rel: String, name: String, mtime: Option<u64>, depth: usize,
         let (c, mut b) = walk(&p, r, n, m, depth + 1, rules, sh);
         if let Some(f) = filter {
             if f.wants(&c.name, Kind::Dir, c.bytes, c.mtime) {
-                b.found.push(Found { path: p.display().to_string(), kind: Kind::Dir, bytes: c.bytes, mtime: c.mtime });
+                b.found.push(Found { path: p.display().to_string(), kind: Kind::Dir, bytes: c.bytes, mtime: c.mtime,
+                                       sha256: None });
             }
         }
         (c, b)

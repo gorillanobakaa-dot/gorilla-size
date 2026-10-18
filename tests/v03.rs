@@ -195,3 +195,13 @@ fn compare_tree_shows_each_change_under_its_folder_text_and_nested_json() {
     assert_eq!((nb["change"].as_str(), nb["before"].is_null(), nb["after"].as_u64()), (Some("new"), true, Some(7000)));
     assert_eq!(kid(&kid(r, "small"), "d.txt")["change"], "gone");
 }
+#[test]
+fn find_format_prints_a_file_named_like_a_placeholder_as_its_name() {
+    // 2026-10-18: `{bytes}.txt` printed as `5.txt`: the value of {name} was searched for placeholders again
+    let t = tmp("fmt");
+    file(&t.0.join("{bytes}.txt"), b"12345");
+    file(&t.0.join("{size} and {path}.log"), b"1");
+    let (rc, out, err) = run(&["find", s(&t.0), "--type", "f", "--sort", "name", "--format", "{name}={bytes}"]);
+    assert_eq!(rc, 0, "{err}");
+    assert_eq!(out.lines().collect::<Vec<_>>(), vec!["{bytes}.txt=5", "{size} and {path}.log=1"], "{out}");
+}
