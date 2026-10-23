@@ -13,6 +13,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Ubuntu 26.04 runners keep /tmp on its own file system: recycle (correctly) refuses to move a test file from
+      # there into ~/.local/share/Trash, since that would be a copy. The test folders go under $HOME instead.
+      - if: runner.os == 'Linux'
+        run: mkdir -p "$HOME/gorilla-size-tests" && echo "TMPDIR=$HOME/gorilla-size-tests" >> "$GITHUB_ENV"
       - run: cargo test --release --offline --locked
       # GitHub's Windows runner is an administrator: the master file table test (--ignored) really runs there
       - if: runner.os == 'Windows'
