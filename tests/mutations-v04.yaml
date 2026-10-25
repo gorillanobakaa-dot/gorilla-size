@@ -1,0 +1,26 @@
+# fieldkit mutate --plan tests/mutations-v04.yaml --cwd . -- cargo test --release --offline --test v04_patterns
+# Each rule of the 2026-10-25 patterns/whole-folder change, broken on purpose: every one must be CAUGHT.
+- file: src/main.rs
+  swap: ["if !glob::path_is_pattern(&p) {", "if true {"]
+  why: "a * is taken literally again (the Gemma 'does not exist' case)"
+- file: src/main.rs
+  swap: ["if x.files.is_empty() {", "if false {"]
+  why: "a pattern that matches nothing is no longer refused with 'matched nothing'"
+- file: src/glob.rs
+  swap: ["Ok(_) if real_dir(cur) => x.folders_skipped.push(cur.to_path_buf()),", "Ok(_) if real_dir(cur) => all_files(cur, x),"]
+  why: "a * in the last place reaches into the folders it names (recursive without being asked)"
+- file: src/glob.rs
+  swap: ["        walk(cur, more, x);\n        for d in subdirs(cur) {", "        for d in subdirs(cur) {"]
+  why: "** no longer matches zero folders"
+- file: src/main.rs
+  swap: ["if !a.whole_folder {", "if false {"]
+  why: "a folder holding files is recycled without --whole-folder"
+- file: src/main.rs
+  swap: ["this recycles all {files} file(s) in it", "this recycles it"]
+  why: "the answer no longer says how many files a whole-folder recycle takes"
+- file: src/actions.rs
+  swap: ["if c != a && !c.starts_with(&inside) {", "if true {"]
+  why: "recycling the caller's own working folder is no longer explained before acting"
+- file: src/actions.rs
+  swap: ["Some(n @ (32 | 33)) if cfg!(windows) =>", "Some(n @ (99 | 33)) if cfg!(windows) =>"]
+  why: "Windows error 32 comes back as the raw 'os error 32' again"

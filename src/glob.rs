@@ -1,6 +1,8 @@
 //! Name patterns: `*` (any run), `?` (one character), `[abc]` / `[a-z]` (one of). Case-insensitive on Windows and
 //! macOS (their file systems are), case-sensitive elsewhere unless asked. Matched against the NAME, not the path.
 
+use std::path::{Component, Path, PathBuf};
+
 pub struct Glob {
     pat: Vec<char>,
     fold: bool,
@@ -96,6 +98,114 @@ fn class(p: &[char], c: char) -> Option<(bool, usize)> {
         }
     }
     Some((hit != neg, end + 1))
+}
+
+// ------------------------------------------------------------------------------------------- paths with patterns
+
+/// `*` or `?` in a path component. `[` alone does not make a pattern: "photo [1].png" is a common real name.
+pub fn is_pattern(c: &str) -> bool {
+    c.contains('*') || c.contains('?')
+}
+
+/// A path the action commands must expand: some component holds `*` or `?` and the path does not exist as written
+/// (Linux allows `*` in a real name; that name wins).
+pub fn path_is_pattern(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_err()
+        && p.components().any(|c| matches!(c, Component::Normal(s) if is_pattern(&s.to_string_lossy())))
+}
+
+#[derive(Debug, Default)]
+pub struct Expansion {
+    /// the FILES matched (links and junctions count as files: never entered), sorted
+    pub files: Vec<PathBuf>,
+    /// folders a pattern named in its last place: never matched (a pattern recycles files, not trees)
+    pub folders_skipped: Vec<PathBuf>,
+    /// the path up to the first pattern component
+    pub base: PathBuf,
+}
+
+/// Expand a path pattern. Each component is a name pattern for the entries of ONE folder level: `dir\*.png` is the
+/// PNG files directly in dir, never below. `**` is any depth of folders (zero included): `dir\**\*.png` is every PNG
+/// under dir; a trailing `**` is every file under it. A component that exists as written is taken as written
+/// (`dir [1]\*.png`). Links and junctions are never entered. The last component matches files only; a folder it
+/// names is reported in `folders_skipped`, not returned.
+pub fn expand(p: &Path) -> Expansion {
+    let mut base = PathBuf::new();
+    let mut rest: Vec<String> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::Normal(s) if !rest.is_empty() || is_pattern(&s.to_string_lossy()) => {
+                rest.push(s.to_string_lossy().into_owned())
+            }
+            other => base.push(other.as_os_str()),
+        }
+    }
+    let mut x = Expansion { base: base.clone(), ..Default::default() };
+    walk(&base, &rest, &mut x);
+    x.files.sort();
+    x.files.dedup();
+    x.folders_skipped.sort();
+    x.folders_skipped.dedup();
+    x
+}
+
+fn real_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).map(|m| m.is_dir() && !m.file_type().is_symlink() && !crate::os::is_reparse_dir(&m))
+        .unwrap_or(false)
+}
+
+fn subdirs(cur: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(cur).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| real_dir(p))
+        .collect()).unwrap_or_default();
+    v.sort();
+    v
+}
+
+fn all_files(cur: &Path, x: &mut Expansion) {
+    if let Ok(rd) = std::fs::read_dir(cur) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if real_dir(&p) { all_files(&p, x) } else { x.files.push(p) }
+        }
+    }
+}
+
+fn walk(cur: &Path, rest: &[String], x: &mut Expansion) {
+    let Some((c, more)) = rest.split_first() else {
+        match std::fs::symlink_metadata(cur) {
+            Ok(_) if real_dir(cur) => x.folders_skipped.push(cur.to_path_buf()),
+            Ok(_) => x.files.push(cur.to_path_buf()),
+            Err(_) => {}
+        }
+        return;
+    };
+    if c == "**" {
+        if more.is_empty() {
+            return all_files(cur, x);
+        }
+        walk(cur, more, x);
+        for d in subdirs(cur) {
+            walk(&d, rest, x);
+        }
+        return;
+    }
+    let literal = cur.join(c);
+    if !is_pattern(c) || std::fs::symlink_metadata(&literal).is_ok() {
+        if more.is_empty() || real_dir(&literal) {
+            walk(&literal, more, x);
+        }
+        return;
+    }
+    let g = Glob::new(c, cfg!(any(windows, target_os = "macos")));
+    let Ok(rd) = std::fs::read_dir(cur) else { return };
+    let mut hits: Vec<PathBuf> = rd.flatten().filter(|e| g.matches(&e.file_name().to_string_lossy()))
+        .map(|e| e.path()).collect();
+    hits.sort();
+    for h in hits {
+        if more.is_empty() || real_dir(&h) {
+            walk(&h, more, x);
+        }
+    }
 }
 
 #[cfg(test)]
