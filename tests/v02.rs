@@ -258,7 +258,7 @@ fn a_large_recycle_is_held_for_a_plan_and_apply_carries_it_out() {
     for i in 0..5 {
         file(&t.0.join(format!("junk/f{i}")), b"x");
     }
-    let held = json(&["recycle", s(&t.0.join("junk")), "--plan-files", "3"]);
+    let held = json(&["recycle", s(&t.0.join("junk")), "--plan-files", "3", "--whole-folder"]);
     assert_eq!(held["held"], true, "{held}");
     assert!(t.0.join("junk/f0").exists(), "nothing touched while held");
     let plan = held["plan"].as_str().unwrap().to_string();
@@ -274,7 +274,7 @@ fn a_large_recycle_is_held_for_a_plan_and_apply_carries_it_out() {
 fn a_plan_whose_files_changed_is_not_applied_to_them() {
     let t = tmp("stale");
     file(&t.0.join("junk/a"), b"x");
-    let held = json(&["recycle", s(&t.0.join("junk")), "--plan"]);
+    let held = json(&["recycle", s(&t.0.join("junk")), "--plan", "--whole-folder"]);
     file(&t.0.join("junk/b"), b"new since the plan");
     let (rc, out, _) = run(&["apply", held["plan"].as_str().unwrap()]);
     assert_eq!(rc, 3, "{out}");
@@ -295,7 +295,7 @@ fn a_path_too_long_for_the_bin_is_refused_before_anything_is_touched() {
     let wide = format!(r"\\?\{}", deep.display());
     fs::create_dir_all(&wide).unwrap();
     fs::write(format!(r"{wide}\f.txt"), b"x").unwrap();
-    let (rc, out, _) = run(&["recycle", s(&t.0.join("long"))]);
+    let (rc, out, _) = run(&["recycle", s(&t.0.join("long")), "--whole-folder"]);
     assert_eq!(rc, 3, "{out}");
     assert!(out.contains("REFUSED, nothing touched") && out.contains("259"), "{out}");
     assert!(t.0.join("long").exists());
@@ -320,7 +320,7 @@ fn a_long_path_that_is_short_inside_the_bin_is_recycled_and_restored() {
     fs::create_dir_all(wide(deep.parent().unwrap())).unwrap();
     fs::write(wide(&deep), b"capture").unwrap();
     assert!(deep.as_os_str().len() > 259, "the test needs an original path over 259");
-    let v = json(&["recycle", s(&item)]);
+    let v = json(&["recycle", s(&item), "--whole-folder"]);
     assert_eq!(v["failed"], 0, "{v}");
     let u = json(&["undo", v["journal"].as_str().unwrap()]);
     assert_eq!(u["failed"], 0, "{u}");
@@ -382,7 +382,7 @@ fn reports_and_plans_saved_with_a_byte_order_mark_are_read() {
     fs::write(t.0.join("new.json"), &bom).unwrap();
     let (rc, _, err) = run(&["compare", s(&t.0.join("old.json")), s(&t.0.join("new.json"))]);
     assert_eq!(rc, 0, "{err}");
-    let held = json(&["recycle", s(&t.0.join("tree")), "--plan"]);
+    let held = json(&["recycle", s(&t.0.join("tree")), "--plan", "--whole-folder"]);
     let plan = held["plan"].as_str().unwrap().to_string();
     let mut p = vec![0xEF, 0xBB, 0xBF];
     p.extend(fs::read(&plan).unwrap());

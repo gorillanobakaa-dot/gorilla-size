@@ -43,7 +43,11 @@ ACT (verified, journalled, undoable; never a permanent delete)
                                            or with --overwrite moved aside first (<name>.gorilla-bak-<time>)
   gorilla-size move SRC ... --to DIR       same drive: rename; other drive: verified copy + recycle
   gorilla-size recycle PATH ...            to the Recycle Bin / trash; refused when Windows would destroy instead;
-                                           verified in the bin's own records
+                                           verified in the bin's own records. A folder that holds files is refused
+                                           unless --whole-folder (the answer names how many and which)
+  PATH patterns (copy, move, recycle): DIR\\*.png = the files in DIR (not below), DIR\\** = every file under DIR,
+                                           DIR\\**\\*.png = every PNG under DIR; ? = one character. Files only, never
+                                           folders; a pattern that matches nothing is refused, nothing touched
   gorilla-size undo JOURNAL                reverse what a journal records
   gorilla-size trash [list]                what is in the Recycle Bin / trash: original place, size, date
   gorilla-size trash restore NAME|PATH ... put items back (by original path, or by name when it is unique)
@@ -142,6 +146,9 @@ struct Args {
     copy_to: Option<PathBuf>,
     move_to: Option<PathBuf>,
     recycle: bool,
+    whole_folder: bool,
+    /// what a pattern expanded to, or a whole folder recycled: carried into the action's answer
+    notes: std::sync::Mutex<Vec<String>>,
     to: Option<PathBuf>,
     overwrite: bool,
     plan_files: u64,
@@ -254,6 +261,7 @@ fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--copy-to" => a.copy_to = Some(PathBuf::from(val("--copy-to")?)),
             "--move-to" => a.move_to = Some(PathBuf::from(val("--move-to")?)),
             "--recycle" => a.recycle = true,
+            "--whole-folder" => a.whole_folder = true,
             "--to" => a.to = Some(PathBuf::from(val("--to")?)),
             "--overwrite" => a.overwrite = true,
             "--plan-files" => a.plan_files = num(val("--plan-files")?, "--plan-files")? as u64,
@@ -769,8 +777,108 @@ fn run_act_paths(a: &Args) -> u8 {
     if a.mode != "recycle" && a.to.is_none() {
         return fail(a, 2, "--to DIR is needed");
     }
-    let items: Vec<PathBuf> = outermost(a.paths.iter().map(|p| absolute(p)).collect());
+    // 2026-10-25: Gemma 4 12B gave `...\bench-playground\*`, got "does not exist" (the `*` taken literally), then
+    // widened to the folder itself, which would also have recycled a file it was never asked about.
+    let mut picked = Vec::new();
+    let mut notes = Vec::new();
+    for p in a.paths.iter().map(|p| absolute(p)) {
+        if !glob::path_is_pattern(&p) {
+            picked.push(p);
+            continue;
+        }
+        let x = glob::expand(&p);
+        if x.files.is_empty() {
+            return fail(a, 3, format!("{} matched nothing, nothing touched: {}", p.display(), why_nothing(&x)));
+        }
+        let mut n = format!("{} matched {} file(s)", p.display(), x.files.len());
+        if !x.folders_skipped.is_empty() {
+            n += &format!("; {} folder(s) it names were left alone (a pattern matches files, never folders): {}",
+                          x.folders_skipped.len(), names(&x.folders_skipped, 5));
+        }
+        notes.push(n);
+        picked.extend(x.files);
+    }
+    let items: Vec<PathBuf> = outermost(picked);
+    if a.mode == "recycle" {
+        for d in items.iter().filter(|p| is_real_dir(p)) {
+            let (files, _) = actions::tally(d);
+            if files == 0 {
+                continue;
+            }
+            let (shown, ext) = first_files(d, 10);
+            if !a.whole_folder {
+                return fail(a, 3, format!(
+                    "{} is a folder: recycling it recycles the whole folder, {files} file(s): {}{}. Refused, nothing \
+                     touched. To recycle only some files give a pattern, such as {}; to recycle the whole folder, \
+                     only if that is what was asked, add --whole-folder",
+                    d.display(), shown.join(", "), if files > shown.len() as u64 { ", ..." } else { "" },
+                    d.join(format!("*.{}", ext.unwrap_or_else(|| "png".into()))).display()));
+            }
+            notes.push(format!("{} is a whole folder (--whole-folder): this recycles all {files} file(s) in it",
+                               d.display()));
+        }
+    }
+    *a.notes.lock().unwrap() = notes;
     act(&a.mode.clone(), &items, a.to.as_deref(), a)
+}
+
+fn is_real_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).map(|m| m.is_dir() && !m.file_type().is_symlink() && !gorilla_size::os::is_reparse_dir(&m))
+        .unwrap_or(false)
+}
+
+fn names(v: &[PathBuf], max: usize) -> String {
+    let mut s: Vec<String> = v.iter().take(max).map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())).collect();
+    if v.len() > max {
+        s.push("...".into());
+    }
+    s.join(", ")
+}
+
+/// Up to `max` file names under `dir` (relative to it), and the extension of the first one that has one.
+fn first_files(dir: &Path, max: usize) -> (Vec<String>, Option<String>) {
+    fn go(base: &Path, cur: &Path, max: usize, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(cur) else { return };
+        let mut v: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        v.sort();
+        for p in v {
+            if out.len() >= max {
+                return;
+            }
+            if is_real_dir(&p) { go(base, &p, max, out) } else { out.push(p) }
+        }
+    }
+    let mut out = Vec::new();
+    go(dir, dir, max, &mut out);
+    // the commonest extension among them: the likeliest pattern to suggest
+    let mut count: std::collections::BTreeMap<String, usize> = Default::default();
+    for e in out.iter().filter_map(|p| p.extension()) {
+        *count.entry(e.to_string_lossy().into_owned()).or_default() += 1;
+    }
+    let ext = count.into_iter().max_by_key(|(_, n)| *n).map(|(e, _)| e);
+    (out.iter().map(|p| p.strip_prefix(dir).unwrap_or(p).display().to_string()).collect(), ext)
+}
+
+/// Why a pattern matched nothing, in words a small model can act on.
+fn why_nothing(x: &glob::Expansion) -> String {
+    if !is_real_dir(&x.base) {
+        return format!("the folder {} does not exist", x.base.display());
+    }
+    let here: Vec<PathBuf> = std::fs::read_dir(&x.base).map(|rd| {
+        let mut v: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        v.sort();
+        v
+    }).unwrap_or_default();
+    let mut s = format!("no file there matches (patterns match files only, one folder level unless ** is used); {} \
+                         holds {} entr{}", x.base.display(), here.len(), if here.len() == 1 { "y" } else { "ies" });
+    if !here.is_empty() {
+        s += &format!(": {}", names(&here, 10));
+    }
+    if !x.folders_skipped.is_empty() {
+        s += &format!("; folders the pattern names (never matched): {}", names(&x.folders_skipped, 5));
+    }
+    s
 }
 
 fn act(op: &str, items: &[PathBuf], to: Option<&Path>, a: &Args) -> u8 {
@@ -827,9 +935,17 @@ fn write_plan(op: &str, items: &[PathBuf], to: Option<&Path>, files: u64, bytes:
                                units::human(bytes), units::count(a.plan_files), units::human(a.plan_bytes)) }
               else { "--plan".to_string() };
     if a.json {
-        print_json(&json!({"held": true, "why": why, "plan": path.display().to_string(), "op": op,
-                           "files": files, "bytes": bytes}));
+        let mut v = json!({"held": true, "why": why, "plan": path.display().to_string(), "op": op,
+                           "files": files, "bytes": bytes});
+        let notes = a.notes.lock().unwrap();
+        if !notes.is_empty() {
+            v["notes"] = json!(*notes);
+        }
+        print_json(&v);
     } else {
+        for n in a.notes.lock().unwrap().iter() {
+            println!("NOTE     {n}");
+        }
         println!("HELD: {why}. Nothing was touched.\nPlan: {}\nReview it, then: gorilla-size apply \"{}\"",
                  path.display(), path.display());
     }
@@ -861,11 +977,19 @@ fn execute(op: &str, items: &[PathBuf], to: Option<&Path>, a: &Args) -> u8 {
 
 fn report_done(done: &[actions::Done], journal: &Path, a: &Args) -> u8 {
     let failed = done.iter().filter(|d| !d.ok).count();
+    let notes = a.notes.lock().unwrap();
     if a.json {
-        print_json(&json!({"journal": journal.display().to_string(), "ok": done.len() - failed, "failed": failed,
+        let mut v = json!({"journal": journal.display().to_string(), "ok": done.len() - failed, "failed": failed,
                            "actions": done.iter().map(|d| json!({"op": d.op, "from": d.from, "to": d.to, "ok": d.ok,
-                                                                  "why": d.why})).collect::<Vec<_>>()}));
+                                                                  "why": d.why})).collect::<Vec<_>>()});
+        if !notes.is_empty() {
+            v["notes"] = json!(*notes);
+        }
+        print_json(&v);
     } else {
+        for n in notes.iter() {
+            println!("NOTE     {n}");
+        }
         for d in done {
             println!("{} {:<8} {}{}  ({})", if d.ok { "OK  " } else { "FAIL" }, d.op, d.from,
                      if d.to.is_empty() { String::new() } else { format!(" -> {}", d.to) }, d.why);

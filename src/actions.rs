@@ -219,6 +219,10 @@ pub fn recycle(p: &Path, j: &mut Journal) -> Done {
     if fs::symlink_metadata(&abs).is_err() {
         return done("recycle", &abs, Path::new(""), false, "does not exist");
     }
+    if let Some(why) = working_folder_of_this_program(&abs) {
+        let _ = j.write(&json!({"op": "recycle", "from": abs.display().to_string(), "ok": false, "refused": why}));
+        return done("recycle", &abs, Path::new(""), false, format!("REFUSED, nothing touched: {why}"));
+    }
     match bin::check(&abs) {
         Err(why) => {
             let _ = j.write(&json!({"op": "recycle", "from": abs.display().to_string(), "ok": false, "refused": why}));
@@ -235,6 +239,49 @@ pub fn recycle(p: &Path, j: &mut Journal) -> Done {
                 done("recycle", &abs, Path::new(""), false, why)
             }
         },
+    }
+}
+
+/// Windows will not move a folder that is a program's current folder (2026-10-25: Gemma 4 12B asked to recycle its
+/// own working folder got "os error 32" and nothing that said why). gorilla-size inherits the current folder of
+/// whatever started it (the agent, the shell), so when that folder is the item or inside it, say so before acting.
+fn working_folder_of_this_program(abs: &Path) -> Option<String> {
+    if !cfg!(windows) || !abs.is_dir() {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let fold = |p: &Path| p.to_string_lossy().to_lowercase();
+    let (c, a) = (fold(&cwd), fold(abs));
+    let inside = format!("{}{}", a.trim_end_matches(std::path::MAIN_SEPARATOR), std::path::MAIN_SEPARATOR);
+    if c != a && !c.starts_with(&inside) {
+        return None;
+    }
+    Some(format!("{} is in use: it is the working folder of the program that started gorilla-size ({}). Windows \
+                  will not move a folder a program is working in. Recycle its contents instead: {}", abs.display(),
+                 cwd.display(), contents_hint(abs)))
+}
+
+/// `dir\*` for a folder: what to give instead of the folder itself
+pub fn contents_hint(dir: &Path) -> String {
+    dir.join("*").display().to_string()
+}
+
+/// A plain-words reason for a failed rename. 32 (ERROR_SHARING_VIOLATION) and 33 (ERROR_LOCK_VIOLATION): another
+/// program holds the item open, or works inside the folder.
+pub fn rename_failure(p: &Path, e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(n @ (32 | 33)) if cfg!(windows) => {
+            let hint = if p.is_dir() {
+                format!("A folder is in use when a program has it (or a folder inside it) as its working folder - an \
+                         agent, a terminal, Explorer - or has a file in it open. Close that, or recycle its contents \
+                         instead: {}", contents_hint(p))
+            } else {
+                "Close the program that has it open, then try again.".to_string()
+            };
+            format!("could not move it into the Recycle Bin: {} is in use by another program (Windows error {n}). \
+                     {hint}. Nothing touched", p.display())
+        }
+        _ => format!("could not move it into the Recycle Bin ({e}); nothing touched"),
     }
 }
 
@@ -585,7 +632,7 @@ mod bin {
                 Ok(()) => Err(format!("moved to {} but the check after it failed: look there", r.display())),
                 Err(e) => {
                     let _ = fs::remove_file(&i);
-                    Err(format!("could not move it into the Recycle Bin ({e}); nothing touched"))
+                    Err(super::rename_failure(p, &e))
                 }
             };
         }
